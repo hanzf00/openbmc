@@ -17,22 +17,27 @@
 
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 
+RDEPENDS_${PN} += "bash"
+
 SRC_URI += "file://setup-fan.sh \
             file://get_fan_speed.sh \
             file://set_fan_speed.sh \
             file://fsc_board.py \
-            file://FSC-PWM-32-config.json \
-            file://FSC-PWM-64-config.json \
-            file://zone1.fsc \
+            file://FSC-W400-config.json \
+            file://FSC-W400C-config.json \
+            file://zone-w400.fsc \
+            file://zone-w400c.fsc \
            "
 
 FSC_BIN_FILES += "get_fan_speed.sh \
                   set_fan_speed.sh "
 
-FSC_CONFIG += "FSC-PWM-32-config.json \
-               FSC-PWM-64-config.json \
+FSC_CONFIG += "FSC-W400-config.json \
+               FSC-W400C-config.json \
               "
 
-FSC_ZONE_CONFIG +="zone1.fsc"
+FSC_ZONE_CONFIG +="zone-w400.fsc \
+                   zone-w400c.fsc \
+                  "
 
 FSC_INIT_FILE += "setup-fan.sh"

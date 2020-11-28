@@ -33,7 +33,7 @@
 #include <openbmc/pal.h>
 #include <openbmc/sdr.h>
 #include <openbmc/kv.h>
-#include <openbmc/obmc-sensor.h>
+#include <openbmc/pal_sensors.h>
 #include <openbmc/fruid.h>
 #include <arpa/inet.h>
 #include "usb-dbg-conf.h"
@@ -654,7 +654,7 @@ udbg_get_cri_sel(uint8_t frame, uint8_t page, uint8_t *next, uint8_t *count, uin
 
 static int
 udbg_get_cri_sensor (uint8_t frame, uint8_t page, uint8_t *next, uint8_t *count, uint8_t *buffer) {
-  char str[32], temp_val[16], temp_thresh[8], print_format[32];
+  char str[64], temp_val[16], temp_thresh[8], print_format[32];
   int i, ret;
   float fvalue;
   thresh_sensor_t thresh;
@@ -736,7 +736,7 @@ udbg_get_cri_sensor (uint8_t frame, uint8_t page, uint8_t *next, uint8_t *count,
 static int
 udbg_get_info_page (uint8_t frame, uint8_t page, uint8_t *next, uint8_t *count, uint8_t *buffer) {
   int ret;
-  char line_buff[1000], *pres_dev = line_buff, *delim = "\n";
+  char line_buff[2048], *pres_dev = line_buff, *delim = "\n";
   FILE *fp;
   fruid_info_t fruid;
   lan_config_t lan_config = { 0 };

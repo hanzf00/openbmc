@@ -36,24 +36,11 @@ IMAGE_INSTALL += " \
   fw-util \
   fpc-util \
   me-util \
-  log-util \
+  log-util-v2 \
   lldp-util \
   spatula \
   openbmc-utils \
   ipmi-util \
   guid-util \
   threshold-util \
-  "
-
-IMAGE_FEATURES += " \
-  ssh-server-openssh \
-  tools-debug \
-  "
-
-DISTRO_FEATURES += " \
-  ext2 \
-  ipv6 \
-  nfs \
-  usbgadget \
-  usbhost \
   "

@@ -2,6 +2,11 @@
 #include "bic_bios.h"
 #include "bic_me.h"
 #include "bic_cpld.h"
+#include "nic.h"
+#include "usbdbg.h"
+
+// Shared NIC
+NicComponent nic("nic", "nic");
 
 // Register BIC FW and BL components
 BicFwComponent bicfw1("slot1", "bic", 1);
@@ -18,3 +23,7 @@ MeComponent me1("slot1", "me", 1);
 
 // Register CPLD components
 CpldComponent cpld1("slot1", "cpld", 1);
+
+// Register USB Debug Card components
+UsbDbgComponent usbdbg("ocpdbg", "mcu", "MINILAKE", 4, 0x60, false);
+UsbDbgBlComponent usbdbgbl("ocpdbg", "mcubl", 4, 0x60, 0x02);  // target ID of bootloader = 0x02

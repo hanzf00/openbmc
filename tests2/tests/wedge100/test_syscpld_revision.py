@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2018-present Facebook. All Rights Reserved.
 #
@@ -29,8 +29,10 @@ class SysCpldRevisionTest(unittest.TestCase):
     def setUp(self):
         self.cpld_rev = "/usr/local/bin/cpld_rev.sh"
         self.cpld_paths = [
-            "/sys/bus/i2c/devices/i2c-12/12-0031/cpld_rev",
-            "/sys/bus/i2c/devices/i2c-12/12-0031/cpld_sub_rev",
+            "/sys/bus/i2c/devices/12-0031/cpld_rev",
+            "/sys/bus/i2c/devices/12-0031/cpld_sub_rev",
+            "/sys/bus/i2c/devices/8-0033/cpld_rev",
+            "/sys/bus/i2c/devices/8-0033/cpld_sub_rev",
         ]
         Logger.start(name=self._testMethodName)
 
@@ -50,6 +52,20 @@ class SysCpldRevisionTest(unittest.TestCase):
         self.assertTrue(
             version[1].isdigit(),
             "CPLD minor version is not digit, received={}".format(version),
+        )
+
+    def test_cpld_fan_revision_format(self):
+        """
+        cpld_rev --fan returns X.X
+        """
+        version = run_shell_cmd([self.cpld_rev, "--fan"]).rstrip("\n").split(".")
+        self.assertTrue(
+            version[0].isdigit(),
+            "Fan major version is not digit, received={}".format(version),
+        )
+        self.assertTrue(
+            version[1].isdigit(),
+            "Fan minor version is not digit, received={}".format(version),
         )
 
     def test_cpld_version_sysfs_path_exists(self):

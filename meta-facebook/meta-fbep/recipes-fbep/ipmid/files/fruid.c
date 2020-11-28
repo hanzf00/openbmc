@@ -32,8 +32,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
-#include "fruid.h"
 #include <openbmc/pal.h>
+#include <facebook/asic.h>
+#include "fruid.h"
 
 #define FRUID_SIZE        512
 /*
@@ -94,20 +95,30 @@ err:
 }
 
 /* Populate the platform specific eeprom for fruid info */
-int plat_fruid_init(void) {
+int plat_fruid_init(void)
+{
+  char path[64] = {0};
 
-  if ( copy_eeprom_to_bin(FRU_EEPROM, FRU_BIN))
-    syslog(LOG_WARNING, "[%s]Copy EEPROM Failed",__func__);
+  if (copy_eeprom_to_bin(MB_EEPROM, MB_BIN))
+    syslog(LOG_WARNING, "[%s]Copy EEPROM to %s Failed",__func__, MB_BIN);
+
+  if (copy_eeprom_to_bin(PDB_EEPROM, PDB_BIN))
+    syslog(LOG_WARNING, "[%s]Copy EEPROM to %s Failed",__func__, PDB_BIN);
+
+  pal_get_fruid_eeprom_path(FRU_BSM, path);
+  if (copy_eeprom_to_bin(path, BSM_BIN))
+    syslog(LOG_WARNING, "[%s]Copy EEPROM to %s Failed",__func__, BSM_BIN);
 
   return 0;
 }
 
-int plat_fruid_size(unsigned char payload_id) {
+int plat_fruid_size(unsigned char payload_id)
+{
   struct stat buf;
   int ret;
 
   // check the size of the file and return size
-  ret = stat(FRU_BIN, &buf);
+  ret = stat(MB_BIN, &buf);
   if (ret) {
     return 0;
   }
@@ -118,9 +129,20 @@ int plat_fruid_size(unsigned char payload_id) {
 int plat_fruid_data(unsigned char payload_id, int fru_id, int offset, int count, unsigned char *data) {
   int fd;
   int ret;
+  char fru_dev[LARGEST_DEVICE_NAME] = {0};
+
+  // Align wiht IPMI FRU ID, 0-based
+  if (fru_id == FRU_MB-1)
+    snprintf(fru_dev, LARGEST_DEVICE_NAME, MB_BIN);
+  else if (fru_id == FRU_PDB-1)
+    snprintf(fru_dev, LARGEST_DEVICE_NAME, PDB_BIN);
+  else if (fru_id == FRU_BSM-1)
+    snprintf(fru_dev, LARGEST_DEVICE_NAME, BSM_BIN);
+  else
+    return -1;
 
   // open file for read purpose
-  fd = open(FRU_BIN, O_RDONLY);
+  fd = open(fru_dev, O_RDONLY);
   if (fd < 0) {
     return fd;
   }

@@ -19,19 +19,30 @@
 
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin
 
-if [ $# -ne 1 ]; then
-    exit -1
-fi
-
-img="$1"
-
 source /usr/local/bin/openbmc-utils.sh
 
-KERNEL_VERSION=`uname -r`
-if [[ ${KERNEL_VERSION} != 4.1.* ]]; then
-    DLL_PATH=/usr/lib/libcpldupdate_dll_jtag.so
-else
-    DLL_PATH=/usr/lib/libcpldupdate_dll_ast_jtag.so
+prog="$0"
+img="$1"
+
+DLL_PATH=/usr/lib/libcpldupdate_dll_ast_jtag.so
+
+
+usage() {
+    echo "Usage: $prog <img_file> <options: hw|sw>"
+    echo
+    echo "img_file: Image file for lattice CPLD"
+    echo "  VME file for software mode"
+    echo "  JED file for hardware mode"
+    echo "options:"
+    echo "  hw: Program the CPLD using JTAG hardware mode"
+    echo "  sw: Program the CPLD using JTAG software mode"
+    echo
+    echo
+}
+
+if [ $# -lt 1 ]; then
+    usage
+    exit 1
 fi
 
 enable_jtag_chain(){
@@ -66,17 +77,44 @@ trap 'rm -rf /tmp/pwrcpld_update' INT TERM QUIT EXIT
 
 echo 1 > /tmp/pwrcpld_update
 
+wedge_prepare_cpld_update
+
 enable_jtag_chain
-ispvm -f 1000 dll $DLL_PATH "${img}"
+
+case $2 in
+    hw)
+        # enable CPLD immediately after cpld update done
+        cpldprog -p "${img}" -R
+        ;;
+    sw)
+        ispvm -f 1000 dll $DLL_PATH "${img}"
+        ;;
+    *)
+        # default: hw mode
+        # enable CPLD immediately after cpld update done
+        cpldprog -p "${img}" -R
+        ;;
+esac
+
 result=$?
+
+if [ "$2" = "sw" ]; then
+    expect=1
+else
+    expect=0
+fi
+
 disable_jtag_chain
 
-# 1 is returned upon upgrade success
-if [ $result -eq 1 ]; then
+# 0 is returned upon upgrade success
+if [ $result -eq $expect ]; then
     echo "Upgrade successful."
+    echo "Re-start fscd service."
+    sv start fscd
     exit 0
 else
     echo "Upgrade failure. Return code from utility : $result"
+    echo "To prevent system reboot. Keep fscd stop & watchdog disable."
     exit 1
 fi
 

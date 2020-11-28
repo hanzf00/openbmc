@@ -2,6 +2,9 @@
 
 inherit kernel_fitimage
 
+IMAGE_FSTYPES_remove = "cpio.lzma.u-boot"
+IMAGE_FSTYPES += "cpio.zst.u-boot"
+
 require recipes-core/images/fb-openbmc-image.bb
 
 # Include modules in rootfs
@@ -16,37 +19,34 @@ IMAGE_INSTALL += " \
   fan-util \
   power-util \
   mterm \
+  front-paneld \
   ipmid \
   fruid \
   sensor-util \
   sensor-mon \
-  log-util \
+  log-util-v2 \
   kcsd \
   healthd \
+  fpc-util \
   fw-util \
   cfg-util \
   ipmi-util \
-  peci-util \
+  peci-util-v2 \
   asd \
   asd-test \
   ipmitool \
   bios-util \
   vboot-utils \
-  libncsi \
   ncsi-util \
-  ncsid \
-  libpldm \
+  gpiod \
+  guid-util \
+  ipmbd \
+  ipmb-util\
+  me-util \
+  i2craw \
+  crashdump \
+  threshold-util \
+  sensor-setup \
   "
 
-IMAGE_FEATURES += " \
-  ssh-server-openssh \
-  tools-debug \
-  "
-
-DISTRO_FEATURES += " \
-  ext2 \
-  ipv6 \
-  nfs \
-  usbgadget \
-  usbhost \
-  "
+# @TODO T60523536 - Re-enable ncsid.

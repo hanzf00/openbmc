@@ -25,10 +25,13 @@ import rest_firmware_info_scm
 import rest_fruid_scm
 import rest_fw_ver
 import rest_peutil
+import rest_pim_details
 import rest_pim_present
 import rest_piminfo
 import rest_pimserial
+import rest_pimstatus
 import rest_seutil
+import rest_system_led_info
 import rest_usb2i2c_reset
 from aiohttp import web
 from rest_utils import dumps_bytestr
@@ -56,6 +59,10 @@ class boardApp_Handler:
     # Handler for sys/pim_serial resource endpoint
     async def rest_pimserial_hdl(self, request):
         return web.json_response(rest_pimserial.get_pimserial())
+
+    # Handler for sys/pimstatus resource endpoint
+    async def rest_pimstatus_hdl(self, request):
+        return web.json_response(rest_pimstatus.get_pimstatus())
 
     # Handler for sys/firmware_info_pim resource endpoint
     async def rest_firmware_info_pim_hdl(self, request):
@@ -92,3 +99,12 @@ class boardApp_Handler:
             "Resources": ["all"],
         }
         return web.json_response(details, dumps=dumps_bytestr)
+
+    # Handler for sys/system_led_info resource endpoint
+    async def rest_system_led_info_hdl(self, request):
+        return web.json_response(
+            rest_system_led_info.get_system_led_info(), dumps=dumps_bytestr
+        )
+
+    async def rest_pimdetails_hdl(self, request):
+        return rest_pim_details.get_pim_details()

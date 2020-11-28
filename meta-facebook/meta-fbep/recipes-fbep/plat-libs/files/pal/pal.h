@@ -22,15 +22,30 @@
 #define __PAL_H__
 
 #include <openbmc/obmc-pal.h>
+#include <openbmc/kv.h>
 #include "pal_sensors.h"
+#include "pal_health.h"
+#include "pal_switch.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define PWR_OPTION_LIST "status, graceful-shutdown, off, on, reset, cycle"
-#define FRU_BIN "/tmp/fruid.bin"
-#define FRU_EEPROM "/sys/class/i2c-dev/i2c-6/device/6-0054/eeprom"
+#define PWR_OPTION_LIST "status, off, on, cycle"
+#define MB_BIN "/tmp/fruid_mb.bin"
+#define MB_EEPROM "/sys/class/i2c-dev/i2c-6/device/6-0054/eeprom"
+#define PDB_BIN "/tmp/fruid_pdb.bin"
+#define PDB_EEPROM "/sys/class/i2c-dev/i2c-16/device/16-0054/eeprom"
+#define BSM_BIN "/tmp/fruid_bsm.bin"
+#define BSM_EEPROM "/sys/class/i2c-dev/i2c-%d/device/%d-0056/eeprom"
+
+#define LARGEST_DEVICE_NAME 120
+#define ERR_NOT_READY -2
+
+#define PFR_MAILBOX_BUS  (4)
+#define PFR_MAILBOX_ADDR (0xB0)
+#define MAIN_CPLD_BUS  (4)
+#define MAIN_CPLD_ADDR (0x84)
 
 extern size_t pal_pwm_cnt;
 extern size_t pal_tach_cnt;
@@ -40,13 +55,45 @@ extern const char pal_fru_list[];
 extern const char pal_server_list[];
 
 enum {
-  FRU_ALL   = 0,
-  FRU_BASE = 1,
+  FRU_ALL = 0,
+  FRU_MB,
+  FRU_PDB,
+  FRU_BSM,
+  FRU_ASIC0,
+  FRU_ASIC1,
+  FRU_ASIC2,
+  FRU_ASIC3,
+  FRU_ASIC4,
+  FRU_ASIC5,
+  FRU_ASIC6,
+  FRU_ASIC7,
 };
 
-#define MAX_NUM_FRUS 1
+enum {
+  SERVER_1 = 0x0,
+  SERVER_2,
+  SERVER_3,
+  SERVER_4,
+};
+
+enum {
+  BMC = 0x0,
+  PCH,
+};
+
+#define MAX_NUM_FRUS 11
 #define MAX_NODES    1
 
+int read_device(const char *device, int *value);
+int write_device(const char *device, int value);
+bool pal_is_server_off(void);
+bool is_device_ready(void);
+int pal_get_server_power(uint8_t fru, uint8_t *status);
+int pal_get_platform_id(uint8_t *id);
+int pal_set_id_led(uint8_t status);
+int pal_check_power_seq(void);
+int pal_check_pwr_brake(void);
+int pal_force_sled_cycle(void);
 #ifdef __cplusplus
 } // extern "C"
 #endif

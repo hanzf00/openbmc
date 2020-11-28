@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <syslog.h>
 #include <pthread.h>
 #include <string.h>
@@ -32,6 +33,11 @@
 #include <inttypes.h>
 #include <locale.h>
 #include <fcntl.h>
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(_a) (sizeof(_a) / sizeof((_a)[0]))
+#endif /* ARRAY_SIZE */
+
 
 #define NIC_FW_VER_PATH "/tmp/cache_store/nic_fw_ver"
 
@@ -51,6 +57,7 @@ const char *ncsi_reason_string[NUM_NCSI_REASON_CODE] = {
   "CHANNEL_NOT_RDY",
   "PKG_NOT_RDY",
   "INVALID_PAYLOAD_LEN",
+  "INFO_NOT_AVAIL",
   "UNKNOWN_CMD_TYPE",
 };
 
@@ -85,6 +92,58 @@ const char *ncsi_cmd_string[NUM_NCSI_CDMS] = {
   "GET_NCSI_PASS_THROUGH_STATISTICS",
 };
 
+
+// Get Link status response
+const char *link_speed_string[] = {
+  "n/a",
+  "10BASE-T half-duplex",
+  "10BASE-T full-duplex",
+  "100BASE-TX half-duplex",
+  "100BASE-T4",
+  "100BASE-TX full-duplex",
+  "1000BASE-T half-duplex",
+  "1000BASE-T full-duplex",
+  "10Gbps",
+  "20Gbps",
+  "25Gbps",
+  "40Gbps",
+  "50Gbps",
+  "100Gbps",
+  "2.5Gbps",
+  "reserved",
+};
+
+// NC-SI lib logging function.
+// If the logging method is printf, it will add '\n' for the message.
+void (*ncsi_log)(int priority, const char *format, ...)
+          __attribute__ ((__format__ (__printf__, 2, 3))) = syslog;
+
+// NC-SI printf
+// priority - syslog priority, e.g. LOG_ERR, LOG_WARINING, ...
+static void ncsi_printf(int priority, const char *format, ...)
+{
+  va_list ap;
+
+  va_start(ap, format);
+  vprintf(format, ap);
+  va_end(ap);
+  printf("\n");
+}
+
+// Configure NC-SI lib logging
+void ncsi_config_log(int log_method)
+{
+  switch (log_method) {
+    case NCSI_LOG_METHOD_SYSLOG:
+      ncsi_log = syslog;
+      break;
+    case NCSI_LOG_METHOD_PRINTF:
+      ncsi_log = ncsi_printf;
+      break;
+    default:
+      break;
+  }
+}
 
 // reload kernel NC-SI driver and trigger NC-SI interface initialization
 int
@@ -272,6 +331,25 @@ ncsi_cc_reson_name(int cc_reason)
   }
 }
 
+// Print up to print_num of data bytes
+// If print_num is 0 or negative, print all data.
+// print_offset is the starting offset printed on each line.
+void print_ncsi_data(void *data, int size, int print_num, int print_offset)
+{
+  int n = (print_num <= 0 || size <= print_num) ? size : print_num;
+  int i;
+
+  for (i = 0; i < n; ++i) {
+  		if (i % 4 == 0)
+  			printf("\n%02d: ", print_offset + i);
+      printf("0x%02x ", ((uint8_t *)data)[i]);
+  }
+  printf("\n");
+
+  if (n < size)
+    printf("...\n");
+}
+
 void print_ncsi_completion_codes(NCSI_NL_RSP_T *rcv_buf)
 {
   uint8_t *pbuf = rcv_buf->msg_payload;
@@ -302,7 +380,6 @@ get_cmd_status(NCSI_NL_RSP_T *rcv_buf)
 void
 print_ncsi_resp(NCSI_NL_RSP_T *rcv_buf)
 {
-  int i = 0;
   int cmd = rcv_buf->hdr.cmd;
 
   print_ncsi_completion_codes(rcv_buf);
@@ -312,6 +389,9 @@ print_ncsi_resp(NCSI_NL_RSP_T *rcv_buf)
   }
 
   switch (cmd) {
+  case NCSI_GET_LINK_STATUS:
+    print_link_status(rcv_buf);
+    break;
   case NCSI_GET_CAPABILITIES:
     print_get_capabilities(rcv_buf);
     break;
@@ -329,13 +409,8 @@ print_ncsi_resp(NCSI_NL_RSP_T *rcv_buf)
     break;
   default:
     printf("Payload length = %d\n",rcv_buf->hdr.payload_length);
-    for (i = 4; i < rcv_buf->hdr.payload_length; ++i) {
-  		if (i && !(i%4))
-  			printf("\n%d: ", 16+i);
-      printf("0x%02x ", rcv_buf->msg_payload[i]);
-    }
-    printf("\n");
-
+    print_ncsi_data(&rcv_buf->msg_payload[4], rcv_buf->hdr.payload_length - 4,
+                    0 /* print all */, sizeof(CTRL_MSG_HDR_t) + 4 /* print off */);
   }
 
   return;
@@ -519,6 +594,40 @@ print_passthrough_stats(NCSI_NL_RSP_T *rcv_buf)
   printf("\n");
 }
 
+
+const char *
+link_speed_to_name(int val)
+{
+  // val is 4 bit value
+  if ((val < 0) ||
+      (val >= ARRAY_SIZE(link_speed_string)) ||
+      (link_speed_string[val] == NULL)) {
+    return "unknown";
+  } else {
+    return link_speed_string[val];
+  }
+}
+
+void
+print_link_status(NCSI_NL_RSP_T *rcv_buf)
+{
+  unsigned char *pbuf = rcv_buf->msg_payload;
+  Get_Link_Status_Response *plink =
+    (Get_Link_Status_Response *)((NCSI_Response_Packet *)(pbuf))->Payload_Data;
+  Link_Status linkstatus;
+  linkstatus.all32 = ntohl(plink->link_status.all32);
+
+  printf("\nLink Flag: ");
+  if (linkstatus.bits.link_flag)
+    printf("Up\n");
+  else
+    printf("Down\n");
+
+  printf("Speed and duplex: %s\n", link_speed_to_name(linkstatus.bits.speed_duplex));
+  printf("\n");
+  return;
+}
+
 int
 handle_get_link_status(NCSI_Response_Packet *resp)
 {
@@ -590,7 +699,11 @@ handle_get_version_id(NCSI_Response_Packet *resp)
   }
 
   lseek(fd, (long)&((Get_Version_ID_Response *)0)->fw_ver, SEEK_SET);
-  read(fd, nic_fw_ver, sizeof(nic_fw_ver));
+  int version_length = read(fd, nic_fw_ver, sizeof(nic_fw_ver));
+  if (version_length != 0 && version_length != sizeof(nic_fw_ver)) {
+    close(fd);
+    return -1;
+  }
   if (memcmp(vidresp->fw_ver, nic_fw_ver, sizeof(nic_fw_ver))) {
     lseek(fd, 0, SEEK_SET);
     if (write(fd, vidresp, sizeof(Get_Version_ID_Response)) == sizeof(Get_Version_ID_Response)) {
@@ -602,16 +715,16 @@ handle_get_version_id(NCSI_Response_Packet *resp)
   return 0;
 }
 
-
-
-
 int
 create_ncsi_ctrl_pkt(NCSI_NL_MSG_T *nl_msg, uint8_t ch, uint8_t cmd,
                      uint16_t payload_len, unsigned char *payload) {
-  sprintf(nl_msg->dev_name, "eth0");
-  nl_msg->channel_id = ch;
   nl_msg->cmd = cmd;
   nl_msg->payload_length = payload_len;
+  nl_msg->channel_id = ch;
+  int package = (ch & 0xE0) >> 5;
+
+  sprintf(nl_msg->dev_name, "eth%d", package);
+//  printf("%s %s\n", __func__, nl_msg->dev_name);
 
   if (payload_len > NCSI_MAX_PAYLOAD) {
     syslog(LOG_ERR, "%s payload length(%d) exceeds threshold(%d), cmd=0x%02x",

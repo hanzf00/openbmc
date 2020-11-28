@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2019-present Facebook. All Rights Reserved.
 #
@@ -24,18 +24,20 @@ import sys
 
 
 _GPIO_SHADOW_DIR = "/tmp/gpionames"
+_GPIO_SYSFS_DIR = "/sys/class/gpio"
 
 
 class Log_Simple:
     def __init__(self, verbose=False):
         self._verbose = verbose
+        self.fp = sys.stdout
 
     def verbose(self, message):
         if self._verbose:
-            print(message)
+            print(message, file=self.fp)
 
     def info(self, message):
-        print(message)
+        print(message, file=self.fp)
 
 
 def read_pin_info(pin_dir):
@@ -52,11 +54,19 @@ def read_pin_info(pin_dir):
     return pin_info
 
 
-def load_gpio_list(logger, pin_details=False):
+def load_gpio_list(logger, legacy=False, pin_details=False):
     gpio_info = {}
-    for filename in os.listdir(_GPIO_SHADOW_DIR):
-        pathname = os.path.join(_GPIO_SHADOW_DIR, filename)
-        if not os.path.islink(pathname):
+    if legacy:
+        path = _GPIO_SYSFS_DIR
+    else:
+        path = _GPIO_SHADOW_DIR
+
+    for filename in os.listdir(path):
+        # Ignore non-gpio directories if in legacy mode
+        if legacy is True and ("gpio" not in filename or "gpiochip" in filename):
+            continue
+        pathname = os.path.join(path, filename)
+        if not legacy and not os.path.islink(pathname):
             continue
 
         logger.verbose("parsing gpio pin %s" % filename)
@@ -69,30 +79,19 @@ def load_gpio_list(logger, pin_details=False):
     return gpio_info
 
 
-def dump_gpio_py_format(gpio_info, filename, logger):
-    logger.verbose("writing gpio info to %s.." % filename)
+def dump_gpio_py_format(gpio_info, fp, logger):
+    import pprint
 
-    with open(filename, "w") as fp:
-        fp.write("plat_gpio_list = {\n")
-        for pin_name, pin_info in gpio_info.items():
-            fp.write("    '%s': {\n" % pin_name)
-            for key, value in pin_info.items():
-                fp.write("        '%s': '%s',\n" % (key, value))
-            fp.write("    },\n")
-        fp.write("}\n")
+    fp.write("plat_gpio_list = ")
+    fp.write(pprint.pformat(gpio_info, indent=4))
+    fp.write("\n")
 
 
-def dump_gpio_json_format(gpio_info, filename, logger):
-    logger.verbose("writing gpio info to %s.." % filename)
+def dump_gpio_json_format(gpio_info, fp, logger):
+    import json
 
-    with open(filename, "w") as fp:
-        fp.write("{\n")
-        for pin_name, pin_info in gpio_info.items():
-            fp.write("    '%s': {\n" % pin_name)
-            for key, value in pin_info.items():
-                fp.write("        '%s': '%s',\n" % (key, value))
-            fp.write("    },\n")
-        fp.write("}\n")
+    fp.write(json.dumps(gpio_info, sort_keys=True, indent=4))
+    fp.write("\n")
 
 
 def dump_summary(gpio_info, logger):
@@ -123,17 +122,32 @@ if __name__ == "__main__":
         default=False,
         help="generate gpio info in json format",
     )
-    parser.add_argument("outfile", action="store")
+    parser.add_argument(
+        "-l",
+        "--legacy",
+        action="store_true",
+        default=False,
+        help="Assume platform does not have /tmp/gpionames",
+    )
+    parser.add_argument("outfile", nargs="?", default="-")
     args = parser.parse_args()
 
     logger = Log_Simple(verbose=args.verbose)
 
-    gpio_info = load_gpio_list(logger, pin_details=args.pin_details)
+    if args.outfile == "-":
+        logger.fp = sys.stderr
+        logger.verbose("writing gpio info to %s.." % "/dev/stdout")
+        outfile = sys.stdout
+    else:
+        logger.verbose("writing gpio info to %s.." % args.outfile)
+        outfile = open(args.outfile, "w")
+
+    gpio_info = load_gpio_list(logger, legacy=args.legacy, pin_details=args.pin_details)
 
     if args.json_format:
-        dump_gpio_json_format(gpio_info, args.outfile, logger)
+        dump_gpio_json_format(gpio_info, outfile, logger)
     else:
-        dump_gpio_py_format(gpio_info, args.outfile, logger)
+        dump_gpio_py_format(gpio_info, outfile, logger)
 
     dump_summary(gpio_info, logger)
     logger.info("Commmand completed successfully!")

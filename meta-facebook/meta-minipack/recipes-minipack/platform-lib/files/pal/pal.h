@@ -22,12 +22,12 @@
 #define __PAL_H__
 
 #include <openbmc/obmc-pal.h>
+#include <openbmc/kv.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <openbmc/kv.h>
 #include <openbmc/ipmi.h>
 #include <stdbool.h>
 #include <math.h>
@@ -37,9 +37,14 @@ extern "C" {
 
 #define GPIO_VAL "/sys/class/gpio/gpio%d/value"
 #define GPIO_DIR "/sys/class/gpio/gpio%d/direction"
+#define SCMCPLD_PATH_FMT I2C_SYSFS_DEV_DIR(2-0035)"/%s"
 #define SMBCPLD_PATH_FMT I2C_SYSFS_DEV_DIR(12-003e)"/%s"
 #define TOP_FCMCPLD_PATH_FMT I2C_SYSFS_DEV_DIR(64-0033)"/%s"
 #define BOTTOM_FCMCPLD_PATH_FMT I2C_SYSFS_DEV_DIR(72-0033)"/%s"
+#define LEFT_PDBCPLD_PATH_FMT I2C_SYSFS_DEV_DIR(55-0060)"/%s"
+#define RIGHT_PDBCPLD_PATH_FMT I2C_SYSFS_DEV_DIR(63-0060)"/%s"
+#define IOBFPGA_PATH_FMT I2C_SYSFS_DEV_DIR(13-0035)"/%s"
+
 #define SENSORD_FILE_SMB "/tmp/cache_store/smb_sensor%d"
 #define SENSORD_FILE_PSU "/tmp/cache_store/psu%d_sensor%d"
 #define KV_PATH "/mnt/data/kv_store/%s"
@@ -166,7 +171,8 @@ extern "C" {
 #define MAX_READ_RETRY 10
 #define DELAY_POWER_OFF 5
 #define DELAY_POWER_CYCLE 10
-#define DELAY_GRACEFUL_SHUTDOWN 1
+// During testing observed that 1sec was too less during server power off action.
+#define DELAY_GRACEFUL_SHUTDOWN 5
 
 #define MAX_POS_READING_MARGIN 127
 #define LARGEST_DEVICE_NAME 128
@@ -178,7 +184,8 @@ extern "C" {
 #define READING_NA -2
 
 #define SCM_RSENSE 1.16
-#define PIM_RSENSE 1.42
+#define PIM_RSENSE 1.06
+#define PIM16O_RSENSE 1.11
 
 #define IPMB_BUS 0
 
@@ -703,7 +710,7 @@ int pal_sensor_threshold_flag(uint8_t fru, uint8_t snr_num, uint16_t *flag);
 int pal_detect_i2c_device(uint8_t bus, uint8_t addr, uint8_t mode, uint8_t force);
 int pal_add_i2c_device(uint8_t bus, uint8_t addr, char *device_name);
 int pal_del_i2c_device(uint8_t bus, uint8_t addr);
-int pal_get_pim_type(uint8_t fru);
+int pal_get_pim_type(uint8_t fru, int retry);
 int pal_set_pim_type_to_file(uint8_t fru, char *type);
 int pal_get_pim_type_from_file(uint8_t fru);
 int pal_set_pim_thresh(uint8_t fru);
@@ -742,6 +749,9 @@ int pal_set_ppin_info(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t 
 int pal_get_fruid_path(uint8_t fru, char *path);
 int pal_ipmb_processing(int bus, void *buf, uint16_t size);
 bool pal_is_mcu_working(void);
+int pal_is_slot_server(uint8_t fru);
+int pal_get_cpld_fpga_fw_ver(uint8_t fru, const char *device, uint8_t* ver);
+int pal_parse_oem_sel(uint8_t fru, uint8_t *sel, char *error_log);
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2018-present Facebook. All Rights Reserved.
 #
@@ -19,6 +19,7 @@
 #
 
 import subprocess
+import unittest
 
 from utils.cit_logger import Logger
 
@@ -46,17 +47,22 @@ class BaseInterfaceTest(object):
         )
         out, err = f.communicate()
         if len(out) == 0 or len(err) != 0:
-            raise Exception(
-                "Device " + self.ifname.encode("utf-8") + " does not exist [FAILED]"
-            )
+            raise Exception("Device " + str(self.ifname) + " does not exist [FAILED]")
         out = out.decode("utf-8")
+        if "inet " not in out:
+            raise Exception(
+                "Device "
+                + str(self.ifname)
+                + " does not have an IPv4 address [FAILED]\ncommand output:"
+                + out
+            )
         ipv4 = out.split("inet ")[1].split("/")[0]
         Logger.debug("Got ip address for " + str(self.ifname))
         return ipv4
 
-    def get_ipv6_address(self):
+    def get_ip_addr_output_inet6(self):
         """
-        Get IPv6 address of a given interface
+        Get list of strings containing ipv6 addresses for a given interface
         """
         f = subprocess.Popen(
             ["ip", "addr", "show", self.ifname.encode("utf-8")],
@@ -76,7 +82,20 @@ class BaseInterfaceTest(object):
             return 1
             # raise Exception("Device " + self.ifname.encode('utf-8') + " does not exist [FAILED]")
         out = out.decode("utf-8")
-        ipv6 = out.split("inet6 ")[1].split("/")[0]
+        if "inet6 " not in out:
+            raise Exception(
+                "Device "
+                + str(self.ifname)
+                + " does not have an IPv6 address [FAILED]\ncommand output:"
+                + out
+            )
+        return out.split("inet6 ")
+
+    def get_ipv6_address(self):
+        """
+        Get IPv6 address of a given interface
+        """
+        ipv6 = self.get_ip_addr_output_inet6()[1].split("/")[0]
         Logger.debug("Got ip address for " + str(self.ifname))
         return ipv6
 
@@ -96,15 +115,24 @@ class BaseInterfaceTest(object):
     def ping_v4(self):
         ip = self.get_ipv4_address()
         cmd = "ping -c 1 -q -w 1 " + ip
+        Logger.info("Executing cmd={}".format(cmd))
         return self.run_ping(cmd)
 
     def ping_v6(self):
         ip = self.get_ipv6_address()
         cmd = "ping6 -c 1 -q -w 1 " + ip
+        Logger.info("Executing cmd={}".format(cmd))
+        return self.run_ping(cmd)
+
+    def ping_v6_link_local(self):
+        ip = self.get_ipv6_address()
+        cmd = "ping6 -c 1 -q -w 1 " + ip + "%" + self.ifname
+        Logger.info("Executing cmd={}".format(cmd))
         return self.run_ping(cmd)
 
 
 class CommonInterfaceTest(BaseInterfaceTest):
+    @unittest.skip("Test not supported in environment")
     def test_eth0_v4_interface(self):
         """
         Tests eth0 v4 interface

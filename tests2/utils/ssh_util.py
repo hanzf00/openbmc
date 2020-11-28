@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2018-present Facebook. All Rights Reserved.
 #
@@ -18,7 +18,7 @@
 # Boston, MA 02110-1301 USA
 #
 
-import pxssh
+from pexpect import pxssh
 
 
 class OpenBMCSSHSession:

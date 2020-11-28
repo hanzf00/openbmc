@@ -22,6 +22,7 @@
 #define __PAL_H__
 
 #include <openbmc/obmc-pal.h>
+#include <openbmc/kv.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,9 +32,7 @@ extern "C" {
 #include <facebook/minilaketb_common.h>
 #include <facebook/minilaketb_fruid.h>
 #include <facebook/minilaketb_sensor.h>
-#include <openbmc/kv.h>
 
-#define MAX_KEY_LEN     64
 #define MAX_NUM_FAN     2
 
 #define MAX_NODES 4
@@ -163,7 +162,7 @@ uint8_t pal_get_status(void);
 int pal_bypass_cmd(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len);
 int pal_get_fan_latch(uint8_t *status);
 int pal_ipmb_processing(int bus, void *buf, uint16_t size);
-bool pal_is_mcu_working(void);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

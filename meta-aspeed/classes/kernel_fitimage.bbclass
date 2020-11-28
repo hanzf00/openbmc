@@ -2,16 +2,8 @@
 # Also generate an image for the OpenBMC ROM and upgradable flash.
 #
 # Copyright (C) 2016-Present, Facebook, Inc.
-
-def image_types_module(d):
-    distro = d.getVar('DISTRO_CODENAME', True)
-    if distro == 'fido' or distro == 'krogoth':
-        return 'image_types_uboot'
-    return 'image_types'
-
 # Inherit u-boot classes if legacy uboot images are in use.
-IMAGE_TYPE_MODULE = '${@image_types_module(d)}'
-inherit ${IMAGE_TYPE_MODULE}
+inherit image_types
 
 # Make Rocko images work just like they would in krogoth
 # That means, let conversion on u-boot call into oe_mkimage so
@@ -35,11 +27,22 @@ ROM_UBOOT_LOADADDRESS ?= "0x28084000"
 #   For kernel and rootfs: 16384
 #   For kernel only: 2690
 FLASH_SIZE ?= "16384"
-UBOOT_MAX_SIZE = "389120"
 FIT_MAX_SIZE = "28442624"
 RECOVERY_MAX_SIZE = "303104"
 SIGNED_UBOOT_MAX_SIZE = "393216"
 SPL_MAX_SIZE = "86016"
+
+#
+# Default maximum u-boot partition size: 380KB, and u-boot checksum is
+# stored at offset 380KB in the flash image.
+#
+UBOOT_PART_MAX_BYTES ?= "389120"
+UBOOT_CKSUM_OFFSET_KB ?= "380"
+
+#
+# Default offset (in KB) of FIT (kernel, rootfs and dtb) in flash image.
+#
+FLASH_FIT_OFFSET_KB ?= "512"
 
 UBOOT_SOURCE ?= "${DEPLOY_DIR_IMAGE}/u-boot-${MACHINE}.${UBOOT_SUFFIX}"
 FIT_SOURCE ?= "${STAGING_DIR_HOST}/etc/fit-${MACHINE}.its"
@@ -60,6 +63,7 @@ UBOOT_FIT_SOURCE ?= "${STAGING_DIR_HOST}/etc/u-boot-fit-${MACHINE}.its"
 UBOOT_FIT[vardepsexclude] = "DATETIME"
 UBOOT_FIT ?= "u-boot-fit-${MACHINE}-${DATETIME}.itb"
 UBOOT_FIT_LINK ?= "u-boot-fit-${MACHINE}.itb"
+DEPENDS_append = " dtc-native"
 
 IMAGE_PREPROCESS_COMMAND += " generate_data_mount_dir ; "
 IMAGE_POSTPROCESS_COMMAND += " flash_image_generate ; "
@@ -69,9 +73,9 @@ generate_data_mount_dir() {
 }
 
 flash_image_generate() {
-    FIT_DESTINATION="${DEPLOY_DIR_IMAGE}/${FIT}"
+    FIT_DESTINATION="${DEPLOY_DIR_IMAGE}/${FIT_LINK}"
     FLASH_IMAGE_DESTINATION="${DEPLOY_DIR_IMAGE}/${FLASH_IMAGE}"
-    UBOOT_FIT_DESTINATION="${DEPLOY_DIR_IMAGE}/${UBOOT_FIT}"
+    UBOOT_FIT_DESTINATION="${DEPLOY_DIR_IMAGE}/${UBOOT_FIT_LINK}"
 
     if [ ! -f $UBOOT_SOURCE ]; then
         echo "U-boot file ${UBOOT_SOURCE} does not exist"
@@ -106,13 +110,12 @@ flash_image_generate() {
 
         # Write an intermediate FIT containing only U-Boot.
         dd if=${UBOOT_FIT_DESTINATION} of=${FLASH_IMAGE_DESTINATION} bs=1k seek=${FLASH_UBOOT_OFFSET} conv=notrunc
-        ln -sf ${UBOOT_FIT} ${DEPLOY_DIR_IMAGE}/${UBOOT_FIT_LINK}
     else
         FLASH_UBOOT_OFFSET=0
-        FLASH_FIT_OFFSET=512
+        FLASH_FIT_OFFSET=${FLASH_FIT_OFFSET_KB}
 
-        if [ $(stat -L -c%s ${UBOOT_SOURCE}) -gt ${SIGNED_UBOOT_MAX_SIZE} ]; then
-            echo "Signed U-boot is too large to fit into partition"
+        if [ $(stat -L -c%s ${UBOOT_SOURCE}) -gt ${UBOOT_PART_MAX_BYTES} ]; then
+            echo "U-boot is too large to fit into partition"
             return 1
         fi
         # Write U-Boot directly to the start of the flash.
@@ -122,6 +125,7 @@ flash_image_generate() {
 
     if [ $(stat -L -c%s ${FIT_DESTINATION}) -gt ${FIT_MAX_SIZE} ]; then
         echo "FIT is too large to fit into its partition"
+        echo "    $(stat -L -c%s ${FIT_DESTINATION}) > ${FIT_MAX_SIZE}"
         return 1
     fi
 
@@ -136,12 +140,11 @@ flash_image_generate() {
     fi
 
     # Generate MD5sums and store in image.
-    echo "{\"$(dd if=${FLASH_IMAGE_DESTINATION} bs=1k count=380 2> /dev/null | md5sum | awk '{print $1}')\": \"Built: $(date)\"}" > ./tmp.md5
-    dd if=./tmp.md5 of=${FLASH_IMAGE_DESTINATION} bs=1k count=4 seek=380 conv=notrunc
+    echo "{\"$(dd if=${FLASH_IMAGE_DESTINATION} bs=1k count=${UBOOT_CKSUM_OFFSET_KB} 2> /dev/null | md5sum | awk '{print $1}')\": \"Built: $(date)\"}" > ./tmp.md5
+    dd if=./tmp.md5 of=${FLASH_IMAGE_DESTINATION} bs=1k count=4 seek=${UBOOT_CKSUM_OFFSET_KB} conv=notrunc
     rm -f ./tmp.md5
 
     ln -sf ${FLASH_IMAGE} ${DEPLOY_DIR_IMAGE}/${FLASH_IMAGE_LINK}
-    ln -sf ${FIT} ${DEPLOY_DIR_IMAGE}/${FIT_LINK}
 }
 
 oe_mkimage() {
@@ -154,8 +157,7 @@ oe_mkimage() {
 
       # Step 1: Prepare a firmware image section
       fitimage_emit_section_maint ${UBOOT_FIT_SOURCE} imagestart
-      fitimage_emit_section_firmware ${UBOOT_FIT_SOURCE} 1 "${UBOOT_SOURCE}" \
-          ${ROM_UBOOT_LOADADDRESS} ${ROM_UBOOT_LOADADDRESS}
+      fitimage_emit_section_firmware ${UBOOT_FIT_SOURCE} 1 "${UBOOT_SOURCE}"
       fitimage_emit_section_maint ${UBOOT_FIT_SOURCE} sectend
 
       # Step 2: Prepare a configurations section
@@ -165,6 +167,7 @@ oe_mkimage() {
       fitimage_emit_section_maint ${UBOOT_FIT_SOURCE} fitend
 
       mkimage -f ${UBOOT_FIT_SOURCE} -E -p ${ROM_UBOOT_POSITION} ${UBOOT_FIT_DESTINATION}
+      ln -sf ${UBOOT_FIT} ${DEPLOY_DIR_IMAGE}/${UBOOT_FIT_LINK}
     fi
 
     KERNEL_FILE="${DEPLOY_DIR_IMAGE}/${KERNEL_IMAGETYPE}"
@@ -195,7 +198,7 @@ oe_mkimage() {
                 bbwarn "${DTB} contains the full path to the the dts file, but only the dtb name should be used."
                 DTB=`basename ${DTB} | sed 's,\.dts$,.dtb,g'`
             fi
-            DTB_PATH="${DEPLOY_DIR_IMAGE}/${KERNEL_IMAGETYPE}-${DTB}"
+            DTB_PATH="${DEPLOY_DIR_IMAGE}/${DTB}"
             fitimage_emit_section_dtb ${FIT_SOURCE} ${dtbcount} ${DTB_PATH}
             dtbcount=`expr ${dtbcount} + 1`
         done
@@ -212,4 +215,5 @@ oe_mkimage() {
 
     # Step 5: Assemble the image
     mkimage -f ${FIT_SOURCE} ${FIT_DESTINATION}
+    ln -sf ${FIT} ${DEPLOY_DIR_IMAGE}/${FIT_LINK}
 }

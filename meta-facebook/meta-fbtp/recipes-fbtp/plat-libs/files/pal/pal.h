@@ -22,12 +22,12 @@
 #define __PAL_H__
 
 #include <openbmc/obmc-pal.h>
+#include <openbmc/kv.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <openbmc/kv.h>
 #include <openbmc/ipmi.h>
 #include <openbmc/ipmb.h>
 #include <openbmc/me.h>
@@ -45,6 +45,8 @@ extern "C" {
 #define MAX_RETRIES_SDR_INIT  30
 #define THERMAL_CONSTANT      255
 #define ERR_NOT_READY         -2
+
+#define PLAT_ID_SKU_MASK 0x10 // BIT4: 0- Single Side, 1- Double Side
 
 #define PWR_OPTION_LIST "status, graceful-shutdown, off, on, reset, cycle"
 
@@ -120,6 +122,7 @@ enum {
   MB_SENSOR_CPU0_THERM_MARGIN = 0x09,
   MB_SENSOR_CPU1_THERM_MARGIN = 0x0A,
 
+  MB_SENSOR_HOST_BOOT_TEMP = 0x7A,
   MB_SENSOR_C2_NVME_CTEMP = 0x7B,
   MB_SENSOR_C3_NVME_CTEMP = 0x7C,
   MB_SENSOR_C4_NVME_CTEMP = 0x7D,
@@ -354,7 +357,6 @@ int pal_get_plat_sku_id(void);
 int pal_get_pwm_value(uint8_t fan_num, uint8_t *value);
 int pal_fan_dead_handle(int fan_num);
 int pal_fan_recovered_handle(int fan_num);
-int pal_PBO(void);
 void pal_sensor_assert_handle(uint8_t fru, uint8_t snr_num, float val, uint8_t thresh);
 void pal_sensor_deassert_handle(uint8_t fru, uint8_t snr_num, float val, uint8_t thresh);
 void pal_post_end_chk(uint8_t *post_end_chk);

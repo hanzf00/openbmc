@@ -20,22 +20,22 @@
 
 import re
 
-import rest_fruid_scm
 import rest_fw_ver
 import rest_peutil
 import rest_pim_present
 import rest_piminfo
 import rest_pimserial
+import rest_pimstatus
 import rest_scdinfo
 import rest_seutil
 from aiohttp import web
-from rest_utils import dumps_bytestr, get_endpoints
+from rest_utils import dumps_bytestr
 
 
 class boardApp_Handler:
     # Handler for sys/mb/fruid/scm resource endpoint
     async def rest_fruid_scm_hdl(self, request):
-        return web.json_response(rest_fruid_scm.get_fruid_scm(), dumps=dumps_bytestr)
+        return web.json_response(rest_seutil.get_seutil(), dumps=dumps_bytestr)
 
     # Handler for sys/mb/scdinfo resource endpoint
     async def rest_scdinfo_hdl(self, request):
@@ -54,6 +54,10 @@ class boardApp_Handler:
     # Handler for sys/pim_serial resource endpoint
     async def rest_pimserial_hdl(self, request):
         return web.json_response(rest_pimserial.get_pimserial())
+
+    # Handler for sys/pimstatus resource endpoint
+    async def rest_pimstatus_hdl(self, request):
+        return web.json_response(rest_pimstatus.get_pimstatus())
 
     # Handler for sys/mb/seutil resource endpoint
     async def rest_seutil_hdl(self, request):

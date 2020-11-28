@@ -47,8 +47,10 @@ extern "C" {
   #define TIMEOUT_IPMB 8
 #endif
 #define MIN_IPMB_REQ_LEN 7
-#define MAX_IPMB_RES_LEN 300
+#define MAX_IPMB_RES_LEN 1024
+#define MAX_IPMB_REQ_LEN 2080
 #define MIN_IPMB_RES_LEN 8
+#define IPMB_PING_LEN 3
 
 typedef struct _ipmb_req_t {
   uint8_t res_slave_addr;
@@ -72,8 +74,14 @@ typedef struct _ipmb_res_t {
 } ipmb_res_t;
 
 int lib_ipmb_handle(unsigned char bus_id,
-                    unsigned char *request, unsigned short req_len,
+                    unsigned char *request, unsigned int req_len,
                     unsigned char *response, unsigned char *res_len);
+int
+lib_ipmb_send_request(uint8_t ipmi_cmd, uint8_t netfn,
+              uint8_t *txbuf, uint8_t txlen, 
+              uint8_t *rxbuf, uint8_t *rxlen,
+              uint8_t bus_num, uint8_t dev_addr, uint8_t bmc_addr);
+
 
 /*
  * ipmb_send():

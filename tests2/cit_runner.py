@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import argparse
 import os
 import unittest
@@ -39,6 +39,10 @@ class Tests:
             "common",
             "minipack",
         ],  # So yamp can import minipack tests and run them only one time
+        "elbert": [
+            "common",
+            "minipack",
+        ],  # So elbert can import minipack tests and run them only one time
     }
 
     def __init__(self, platform, start_dir=BMC_START_DIR, pattern="test*.py"):
@@ -113,6 +117,13 @@ def set_external(args):
         os.environ["TEST_BMC_HOSTNAME"] = args.bmc_host
 
 
+def set_fw_args(args):
+    """
+    Optional arguments for firmware upgrade test
+    """
+    os.environ["TEST_FW_OPT_ARGS"] = args.firmware_opt_args
+
+
 def get_tests(platform, start_dir, pattern=None):
     if pattern:
         return Tests(platform, start_dir, pattern).get_all_platform_tests()
@@ -132,13 +143,16 @@ def arg_parser():
 
     Running tests on target BMC: test pattern "test_*"
     Running tests on target BMC & CPU from outside BMC: test pattern "external_*"
+    Running tests on target BMC & CPU from outside BMC: test pattern "external_fw_upgrade*"
     Running stress tests on target BMC: test pattern "stress_*"
 
     Usage Examples:
     On devserver:
     List tests : python cit_runner.py --platform wedge100 --list-tests --start-dir tests/
     List tests that need to connect to BMC: python cit_runner.py --platform wedge100 --list-tests --start-dir tests/ --external --host "NAME"
-    Run tests that need to connect to BMC: python cit_runner.py --platform wedge100 --start-dir tests/ --external --host "NAME"
+    List real upgrade firmware external tests that connect to BMC: python cit_runner.py --platform wedge100 --list-tests --start-dir tests/ --upgrade-fw
+    Run tests that need to connect to BMC: python cit_runner.py --platform wedge100 --start-dir tests/ --external --bmc-host "NAME"
+    Run real upgrade firmware external tests that connect to BMC: python cit_runner.py --platform wedge100 --run-tests "path" --upgrade --bmc-host "NAME" --firmware-opt-args="-f -v"
     Run single/test that need connect to BMC: python cit_runner.py --run-test "path" --external --host "NAME"
 
     On BMC:
@@ -153,33 +167,42 @@ def arg_parser():
 
     parser.add_argument(
         "--platform",
+        "-p",
         help="Run all tests in platform by platform name",
         choices=[
             "wedge",
             "wedge100",
+            "wedge400",
+            "wedge400c",
+            "cloudripper",
             "galaxy100",
             "cmm",
             "minipack",
             "fbtp",
             "fby2",
+            "fuji",
             "yosemite",
             "lightning",
             "fbttn",
             "yamp",
+            "elbert",
+            "fby3",
         ],
     )
     parser.add_argument(
         "--run-test",
+        "-r",
         help="Path to run a single test. Example: \
                         tests.wedge100.test_eeprom.EepromTest.test_odm_pcb",
     )
 
     parser.add_argument(
-        "--list-tests", action="store_true", help="List all available tests"
+        "--list-tests", "-l", action="store_true", help="List all available tests"
     )
 
     parser.add_argument(
         "--start-dir",
+        "-s",
         help="Path for where test discovery should start \
                         default: /usr/local/bin/tests2/tests/",
         default=BMC_START_DIR,
@@ -193,6 +216,34 @@ def arg_parser():
         action="store_true",
         default=False,
     )  # find better way to represent this ?
+
+    parser.add_argument(
+        "--upgrade-fw",
+        help="Run tests from outside BMC, these are tests that have \
+                        pattern external_test*.py, require --host to be set",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--firmware-opt-args",
+        help="Set optional arguments for external firmware upgrading \
+                        -To skip upgrading of desired components, please use the \
+                        component name e.g bios, scm ... etc with '--skip'. \
+                        -To show summary skipped components information, and \
+                        enable verbose mode , add '--verbose' to the argument string. \
+                        -To force to upgrade all components(except skipped comps) \
+                        , add '--force' to the argument string.\
+                        example: --firmware-opt-args='--skip=bios,scm --verbose --force'",
+        type=str,
+    )
+
+    parser.add_argument(
+        "--fw-upgrade",
+        help="Firmware upgrade test, these are tests that have \
+                        pattern fw_test*.py, require --host to be set",
+        action="store_true",
+        default=False,
+    )
 
     parser.add_argument(
         "--host",
@@ -237,9 +288,22 @@ if __name__ == "__main__":
     args = arg_parser()
     pattern = None
 
-    if args.external:
-        pattern = "external*.py"
+    if args.platform == "wedge400c":
+        args.platform = "wedge400"
+
+    if args.upgrade_fw:
+        pattern = "external_fw_upgrade*.py"
         set_external(args)
+
+    if args.external:
+        pattern = "external_test*.py"
+        set_external(args)
+
+    if args.firmware_opt_args:
+        set_fw_args(args)
+
+    if args.fw_upgrade:
+        pattern = "fw*.py"
 
     if args.stress:
         pattern = "stress*.py"

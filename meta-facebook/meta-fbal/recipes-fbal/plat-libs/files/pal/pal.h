@@ -22,43 +22,55 @@
 #define __PAL_H__
 
 #include <openbmc/obmc-pal.h>
-#include "pal_sensors.h"
-#include "pal_health.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+#include "pal_sensors.h"
+#include "pal_health.h"
+#include "pal_sbmc.h"
+#include "pal_power.h"
+#include "pal_cm.h"
+#include "pal_ep.h"
+#include "pal_cc.h"
 
 #define PWR_OPTION_LIST "status, graceful-shutdown, off, on, reset, cycle"
-#define FRU_EEPROM_MB    "/sys/class/i2c-dev/i2c-4/device/4-0054/eeprom"
+#define FRU_EEPROM_MB_T  "/sys/class/i2c-dev/i2c-4/device/4-00%d/eeprom"
+#define FRU_EEPROM_NIC0  "/sys/class/i2c-dev/i2c-17/device/17-0050/eeprom"
+#define FRU_EEPROM_NIC1  "/sys/class/i2c-dev/i2c-18/device/18-0052/eeprom"
+#define FRU_EEPROM_BMC  "/sys/class/i2c-dev/i2c-13/device/13-0056/eeprom"
 #define LARGEST_DEVICE_NAME (120)
 #define UNIT_DIV            (1000)
 #define ERR_NOT_READY       (-2)
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
-extern size_t pal_pwm_cnt;
-extern size_t pal_tach_cnt;
-extern const char pal_pwm_list[];
-extern const char pal_tach_list[];
-extern const char pal_fru_list[];
-extern const char pal_server_list[];
+#define PAGE_SIZE  0x1000
+#define AST_GPIO_BASE 0x1e780000
+#define UARTSW_OFFSET 0x68
 
-enum {
-  FAN_0 = 0,
-  FAN_1,
-};
+#define PFR_MAILBOX_BUS  (4)
+#define PFR_MAILBOX_ADDR (0xB0)
 
 enum {
   FRU_ALL  = 0,
-  FRU_MB   = 1,
-  FRU_PDB  = 2,
-  FRU_NIC0 = 3,
-  FRU_NIC1 = 4,
-  FRU_DBG  = 5,
-  FRU_BMC  = 6,
+  FRU_MB,
+  FRU_PDB,
+  FRU_NIC0,
+  FRU_NIC1,
+  FRU_DBG,
+  FRU_BMC,
+  FRU_CNT,
 };
 
-#define MAX_NUM_FRUS    (4)
+enum {
+  REV_PO = 0,
+  REV_EVT,
+  REV_DVT,
+  REV_PVT,
+  REV_MP,
+};
+
+#define MAX_NUM_FRUS    (FRU_CNT-1)
 #define MAX_NODES       (1)
 #define READING_SKIP    (1)
 #define READING_NA      (-2)
@@ -74,6 +86,7 @@ enum{
 };
 
 enum {
+  BOOT_DEVICE_USB      = 0x0,
   BOOT_DEVICE_IPV4     = 0x1,
   BOOT_DEVICE_HDD      = 0x2,
   BOOT_DEVICE_CDROM    = 0x3,
@@ -128,26 +141,111 @@ enum {
   I2C_BUS_23,
 };
 
-int pal_is_fru_prsnt(uint8_t fru, uint8_t *status);
-int pal_is_slot_server(uint8_t fru);
-int pal_get_server_power(uint8_t fru, uint8_t *status);
-int pal_set_server_power(uint8_t fru, uint8_t cmd);
-int pal_sled_cycle(void);
-int pal_set_rst_btn(uint8_t slot, uint8_t status);
-int pal_set_led(uint8_t slot, uint8_t status);
-int pal_set_id_led(uint8_t slot, uint8_t status);
-int pal_get_fru_id(char *fru_str, uint8_t *fru);
-int pal_get_fru_name(uint8_t fru, char *name);
-int pal_get_key_value(char *key, char *value);
-int pal_set_key_value(char *key, char *value);
-int pal_get_last_pwr_state(uint8_t fru, char *state);
-int pal_set_last_pwr_state(uint8_t fru, char *state);
-bool is_server_off(void);
-void pal_update_ts_sled();
-void pal_get_chassis_status(uint8_t slot, uint8_t *req_data, uint8_t *res_data, uint8_t *res_len);
+//Other BMC Device INfo
+#define BMC_IPMB_BUS_ID            (I2C_BUS_2)
+#define BMC0_SLAVE_DEF_ADDR        (0x20)
+#define BMC1_SLAVE_DEF_ADDR        (0x22)
+#define BMC2_SLAVE_DEF_ADDR        (0x24)
+#define BMC3_SLAVE_DEF_ADDR        (0x26)
+
+//Main CPLD Device Info
+#define MAIN_CPLD_BUS_ID           (I2C_BUS_4)
+#define MAIN_CPLD_PWR_STATE_ADDR   (0x32)
+#define MAIN_CPLD_PWR_STATE_CMD    (0x0003)
+
+#define CPLD_PWR_CPU_FAULT            (1)
+#define CPLD_PWR_CPU_OFF              (2)
+#define CPLD_PWR_CPU_PVCCIO           (3)
+#define CPLD_PWR_P1V8_PCIE_P1V1       (4)
+#define CPLD_PWR_PVCCIN               (6)
+#define CPLD_PWR_PVCCSA               (7)
+#define CPLD_PWR_CPU_DONE             (8)
+#define CPLD_PWR_PVCCSA_OFF           (9)
+#define CPLD_PWR_PVCCIN_OFF          (10)
+#define CPLD_PWR_P1V8_PCIE_P1V1_OFF  (12)
+#define CPLD_PWR_PVCCIO_OFF          (13)
+
+//NM Device Info
+#define NM_IPMB_BUS_ID             (I2C_BUS_5)
+#define NM_SLAVE_ADDR              (0x2C)
+
+//FBEP Device Info
+#define ASIC_IPMB_BUS_ID           (I2C_BUS_6)
+#define ASIC_BMC_SLAVE_ADDR        (0x2C)
+
+
+#define NM_IPMB_BUS_ID          (I2C_BUS_5)
+#define NM_SLAVE_ADDR           (0x2C)
+#define BMC0_SLAVE_DEF_ADDR     (0x20)
+#define BMC1_SLAVE_DEF_ADDR     (0x22)
+#define BMC2_SLAVE_DEF_ADDR     (0x24)
+#define BMC3_SLAVE_DEF_ADDR     (0x26)
+#define BMC_IPMB_BUS_ID         (I2C_BUS_2)
+#define ASIC_BMC_SLAVE_ADDR     (0x2C)
+#define ASIC_IPMB_BUS_ID        (I2C_BUS_6)
+#define IOX_BMC_SLAVE_ADDR      (0x2E)
+#define IOX_IPMB_BUS_ID         (I2C_BUS_6)
+
+enum {
+  MB_ID0 = 0,
+  MB_ID1
+};
+
+enum {
+  MB1_MASTER_8S = 0,
+  MB2_MASTER_8S,
+  MB3_MASTER_8S,
+  MB4_MASTER_8S,
+  ALL_2S_MODE,
+};
+
+enum {
+  MB_8S_MODE = 0,  //SKT_ID[2:1] 00
+  MB_4S_MODE,      //SKT_ID[2:1] 01
+  MB_2S_MODE,      //SKT_ID[2:1] 10
+};
+
+int pal_set_id_led(uint8_t fru, uint8_t status);
+int pal_set_fault_led(uint8_t fru, uint8_t status);
 int read_device(const char *device, int *value);
 int pal_get_rst_btn(uint8_t *status);
+int pal_postcode_select(int option);
+int pal_uart_select_led_set(void);
+int pal_get_me_fw_ver(uint8_t bus, uint8_t addr, uint8_t *ver);
+int pal_get_platform_id(uint8_t *id);
+int pal_get_host_system_mode(uint8_t* mode);
+int pal_get_config_is_master(void);
+int pal_get_blade_id(uint8_t *id);
+int pal_get_mb_position(uint8_t* pos);
+int pal_get_board_rev_id(uint8_t *id);
+void fru_eeprom_mb_check(char* mb_path);
+bool is_cpu_socket_occupy(uint8_t cpu_idx);
+int pal_get_syscfg_text(char *text);
+int pal_peer_tray_get_lan_config(uint8_t sel, uint8_t *buf, uint8_t *rlen);
 
+enum {
+  POSTCODE_BY_BMC,
+  POSTCODE_BY_HOST,
+};
+
+enum {
+  BRIDGE_2_CM = BYPASS_CNT,
+  BRIDGE_2_MB_BMC0,
+  BRIDGE_2_MB_BMC1,
+  BRIDGE_2_MB_BMC2,
+  BRIDGE_2_MB_BMC3,
+  BRIDGE_2_ASIC_BMC,
+  BRIDGE_2_IOX_BMC,
+};
+
+enum {
+  CC_OEM_DEVICE_NOT_PRESENT = 0x30,
+  CC_OEM_DEVICE_INFO_ERR = 0x31,
+  CC_OEM_DEVICE_DESTINATION_ERR = 0x32,
+  CC_OEM_DEVICE_SEND_SLAVE_RESTORE_POWER_POLICY_FAIL =0x33,
+  CC_OEM_GET_SELF_ADDRESS_ERR = 0x34,
+  CC_OEM_ONLY_SUPPORT_MASTER = 0x35,
+};
 
 #ifdef __cplusplus
 } // extern "C"

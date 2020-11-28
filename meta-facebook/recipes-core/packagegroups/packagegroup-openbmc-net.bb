@@ -8,11 +8,12 @@ inherit packagegroup
 RDEPENDS_${PN} += " \
   bind-utils \
   curl \
-  dhcp-client \
   iproute2 \
-  ntp \
-  ntp-utils \
+  libndp \
   ntpdate \
   openssh-sftp-server \
-  sntp \
   "
+
+RDEPENDS_${PN}_append = " \
+    ${@bb.utils.contains('DISTRO_FEATURES', 'systemd', '', 'ntp ntpq sntp dhcp-client', d)} \
+    "

@@ -25,7 +25,7 @@
 #include <openbmc/ipmi.h>
 #include <openbmc/ipmb.h>
 #include <openbmc/obmc-pal.h>
-#include <openbmc/obmc-sensor.h>
+#include <openbmc/obmc_pal_sensors.h>
 #include <facebook/bic.h>
 #include <facebook/fby2_common.h>
 
@@ -42,7 +42,34 @@ extern "C" {
 #define EER_READ_NA           -3
 #define EER_UNHANDLED         -4
 
+#define PWM_UNIT_MAX 96
+
 #define SYS_CONFIG_PATH "/mnt/data/kv_store/sys_config/"
+
+#define MAX_NUM_DEVS 12
+
+enum {
+  DEV_TYPE_UNKNOWN,
+  DEV_TYPE_SSD,
+  DEV_TYPE_VSI_ACC,
+  DEV_TYPE_BRCM_ACC,
+  DEV_TYPE_OTHER_ACC,
+  DEV_TYPE_DUAL_M2,
+  DEV_TYPE_SPH_ACC,
+};
+
+enum {
+  VENDOR_SAMSUNG = 0x144D,
+  VENDOR_VSI = 0x1D9B,
+  VENDOR_BRCM = 0x14E4,
+  VENDOR_SPH = 0x8086,
+};
+
+enum {
+  DEVICE_ID_RP = 0xFACE,
+  DEVICE_ID_VK = 0x5E87,
+  DEVICE_ID_PM983 = 0xA808,
+};
 
 typedef struct {
   const char *dimm_location_file;
@@ -112,6 +139,7 @@ enum {
   BIC_SENSOR_MEM_ECC_ERR = 0x63, //Event-only
   BIC_SENSOR_PROC_FAIL = 0x65, //Discrete
   BIC_SENSOR_SYS_BOOT_STAT = 0x7E, //Discrete
+  HOST_BOOT_DRIVE_TEMP = 0xA0,
   BIC_SENSOR_VR_HOT = 0xB2, //Discrete
   BIC_SENSOR_CPU_DIMM_HOT = 0xB3, //Discrete
   BIC_SENSOR_SOC_DIMMA0_TEMP = 0xB4,
@@ -260,8 +288,15 @@ enum {
   SP_SENSOR_HSC_OUT_CURR = 0xC1,
   SP_SENSOR_HSC_TEMP = 0xC2,
   SP_SENSOR_HSC_IN_POWER = 0xC3,
+  SP_SENSOR_HSC_IN_POWERAVG = 0xC7,
   SP_SENSOR_HSC_PEAK_IOUT = 0xC4,
   SP_SENSOR_HSC_PEAK_PIN = 0xC5,
+  SP_SENSOR_BMC_HSC_PIN = 0xC6,
+  SP_SENSOR_FAN0_PWM = 0xD0,
+  SP_SENSOR_FAN1_PWM = 0xD1,
+  SP_SENSOR_FAN2_PWM = 0xD2,
+  SP_SENSOR_FAN3_PWM = 0xD3,
+
 };
 
 //Glacier Point
@@ -391,7 +426,7 @@ enum {
   BIC_ND_SENSOR_MB_INLET_TEMP = 0x01,
   BIC_ND_SENSOR_PVDDCR_CPU_VR_T = 0x02,
   BIC_ND_SENSOR_PVDDCR_SOC_VR_T = 0x03,
-  BIC_ND_SENSOR_SOC_CPU0_TEMP = 0x05,
+  BIC_ND_SENSOR_SOC_TEMP = 0x05,
   BIC_ND_SENSOR_MB_OUTLET_TEMP_T = 0x07,
   BIC_ND_SENSOR_PVDDIO_EFGH_VR_T = 0x0A,
   BIC_ND_SENSOR_PVDDIO_ABCD_VR_T = 0x0B,
@@ -426,12 +461,10 @@ enum {
   BIC_ND_SENSOR_PROCESSOR_FAIL = 0x65, //Discrete
   BIC_ND_SENSOR_VR_HOT = 0xB2, //Discrete
   BIC_ND_SENSOR_CPU_DIMM_HOT = 0xB3, //Discrete
-  BIC_ND_SENSOR_SOC_DIMMA_TEMP = 0xB4,
-  BIC_ND_SENSOR_SOC_DIMMC_TEMP = 0xB5,
-  BIC_ND_SENSOR_SOC_DIMMD_TEMP = 0xB6,
-  BIC_ND_SENSOR_SOC_DIMME_TEMP = 0xB7,
-  BIC_ND_SENSOR_SOC_DIMMG_TEMP = 0xB8,
-  BIC_ND_SENSOR_SOC_DIMMH_TEMP = 0xB9,
+  BIC_ND_SENSOR_SOC_DIMMC0_TEMP = 0xB5,
+  BIC_ND_SENSOR_SOC_DIMMD0_TEMP = 0xB6,
+  BIC_ND_SENSOR_SOC_DIMMG0_TEMP = 0xB8,
+  BIC_ND_SENSOR_SOC_DIMMH0_TEMP = 0xB9,
   BIC_ND_SENSOR_P3V3_MB = 0xD0,
   BIC_ND_SENSOR_P12V_STBY_MB = 0xD2,
   BIC_ND_SENSOR_P1V8_BIC = 0xD3,
@@ -440,6 +473,7 @@ enum {
   BIC_ND_SENSOR_PV_BAT = 0xD7,
   BIC_ND_SENSOR_PVPP_ABCD = 0xD8,
   BIC_ND_SENSOR_P1V8_STBY_BIC = 0xD9,
+  ND_HOST_BOOT_DRIVE_TEMP = HOST_BOOT_DRIVE_TEMP,
 };
 
 enum {
@@ -474,6 +508,7 @@ extern const uint8_t spb_sensor_dual_r_fan_list[];
 extern const uint8_t nic_sensor_list[];
 
 #ifdef CONFIG_FBY2_GPV2
+extern const uint8_t nic_yv250_sensor_list[];
 extern const uint8_t gpv2_sensor_list[];
 #endif
 
@@ -510,6 +545,7 @@ extern size_t nic_sensor_cnt;
 extern size_t dc_cf_sensor_cnt;
 
 #ifdef CONFIG_FBY2_GPV2
+extern size_t nic_yv250_sensor_cnt;
 extern size_t gpv2_sensor_cnt;
 #endif
 
@@ -517,6 +553,7 @@ extern size_t gpv2_sensor_cnt;
 extern size_t bic_nd_sensor_cnt;
 #endif
 
+int read_pwm_value(uint8_t fan_num, uint8_t *value);
 int fby2_sensor_read(uint8_t fru, uint8_t sensor_num, void *value);
 int fby2_sensor_name(uint8_t fru, uint8_t sensor_num, char *name);
 int fby2_sensor_units(uint8_t fru, uint8_t sensor_num, char *units);
@@ -524,12 +561,19 @@ int fby2_sensor_sdr_path(uint8_t fru, char *path);
 int fby2_sensor_threshold(uint8_t fru, uint8_t sensor_num, uint8_t thresh, float *value);
 int fby2_sensor_sdr_init(uint8_t fru, sensor_info_t *sinfo);
 int fby2_get_slot_type(uint8_t fru);
+int fby2_get_record_slot_type(uint8_t fru);
+int fby2_set_slot_type(uint8_t fru,uint8_t type);
 int fby2_get_server_type(uint8_t fru, uint8_t *type);
 int fby2_get_server_type_directly(uint8_t fru, uint8_t *type);
 int fby2_mux_control(char *device, uint8_t addr, uint8_t channel);
 int fby2_disable_gp_m2_monior(uint8_t slot_id, uint8_t dis);
 int fby2_check_hsc_sts_iout(uint8_t mask);
 int fby2_check_hsc_fault(void);
+int fby2_get_m2_info_from_bios(uint8_t slot_id, uint8_t dev_index, bool *present, uint16_t *vendor_id, uint16_t * device_id, uint8_t* link_speed, uint8_t* link_width);
+int fby2_get_m2_type_from_bios(uint8_t slot_id, uint8_t dev_index, uint8_t *type);
+int fby2_get_slot_dev_type(uint8_t slot_id, uint8_t *dev_type);
+int fby2_sdr_init(uint8_t fru, bool force);
+int fby2_sensor_poll_interval(uint8_t fru, uint8_t sensor_num, uint32_t *value);
 
 #ifdef __cplusplus
 } // extern "C"

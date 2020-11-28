@@ -31,8 +31,12 @@
 /* max ethernet frame size = 1518 */
 /* ethernet headr (14) + nc-si header (16) + nc-si payload (1480) + nc-si checksum (4) + 4 (FCS) = 1518*/
 
-
-#define NCSI_MAX_RESPONSE 1024 /* maximum payload size*/
+/* Maximum NC-SI netlink response
+ * Kernel sends all frame data after ethernet header, including FCS,
+ * as netlink response data.
+ *    nc-si header (16) + nc-si payload (1480) + nc-si checksum (4) + FCS (4) = 1504
+ */
+#define NCSI_MAX_NL_RESPONSE (sizeof(CTRL_MSG_HDR_t) + NCSI_MAX_PAYLOAD + 4 + 4)
 
 // NCSI Reset time. NCSI Spec specfies NIC to finish reset within 2second max,
 // here we add an extra 1 sec to provide extra buffer
@@ -86,7 +90,23 @@
 #define NUM_NCSI_CDMS 27
 extern const char *ncsi_cmd_string[NUM_NCSI_CDMS];
 
-
+// defined in DSP0222 Table 9
+typedef struct ctrl_msg_hdr {
+/* 16 bytes NC-SI header */
+	unsigned char  MC_ID;
+	/* For NC-SI 1.0 spec, this field has to set 0x01 */
+	unsigned char  Header_Revision;
+	unsigned char  Reserved_1; /* Reserved has to set to 0x00 */
+	unsigned char  IID; /* Instance ID */
+	unsigned char  Command;
+	unsigned char  Channel_ID;
+	/* Payload Length = 12 bits, 4 bits are reserved */
+	unsigned short Payload_Length;
+	unsigned short  Reserved_2;
+	unsigned short  Reserved_3;
+	unsigned short  Reserved_4;
+	unsigned short  Reserved_5;
+} __attribute__((packed)) CTRL_MSG_HDR_t;
 
 typedef struct ncsi_nl_msg_t {
   char dev_name[10];
@@ -104,7 +124,7 @@ typedef struct ncsi_nl_rsp_hdr_t {
 
 typedef struct ncsi_nl_response {
   NCSI_NL_RSP_HDR_T hdr;
-  unsigned char msg_payload[NCSI_MAX_RESPONSE];
+  unsigned char msg_payload[NCSI_MAX_NL_RESPONSE];
 } __attribute__((packed)) NCSI_NL_RSP_T;
 
 
@@ -173,13 +193,14 @@ enum {
 };
 
 
-#define NUM_NCSI_REASON_CODE             7
+#define NUM_NCSI_REASON_CODE             8
 #define REASON_NO_ERROR             0x0000
 #define REASON_INTF_INIT_REQD       0x0001
 #define REASON_PARAM_INVALID        0x0002
 #define REASON_CHANNEL_NOT_RDY      0x0003
 #define REASON_PKG_NOT_RDY          0x0004
 #define REASON_INVALID_PAYLOAD_LEN  0x0005
+#define REASON_INFO_NOT_AVAIL       0x0006
 #define REASON_UNKNOWN_CMD_TYPE     0x7FFF
 
 
@@ -188,7 +209,7 @@ typedef struct {
 /* end of NC-SI header */
 	unsigned short  Response_Code;
 	unsigned short  Reason_Code;
-	unsigned char   Payload_Data[512];
+	unsigned char   Payload_Data[NCSI_MAX_PAYLOAD];
 } __attribute__((packed)) NCSI_Response_Packet;
 
 typedef struct {
@@ -297,12 +318,24 @@ typedef struct {
 } __attribute__((packed)) NCSI_Passthrough_Stats_Response;
 
 
+enum {
+  NCSI_LOG_METHOD_SYSLOG = 0,
+  NCSI_LOG_METHOD_DEFAULT = NCSI_LOG_METHOD_SYSLOG,
+  NCSI_LOG_METHOD_PRINTF,
+  NCSI_LOG_METHOD_MAX
+};
+
+void ncsi_config_log(int log_method);
+extern void (*ncsi_log)(int priority, const char *format, ...)
+              __attribute__ ((__format__ (__printf__, 2, 3)));
+
 int ncsi_init_if(int);
 void handle_ncsi_config(int delay);
 int getMacAddr(int *values);
 int checkValidMacAddr(int *value);
 int check_valid_mac_addr(void);
 const char * ncsi_cmd_type_to_name(int cmd);
+void print_ncsi_data(void *data, int size, int print_num, int print_offset);
 void print_ncsi_completion_codes(NCSI_NL_RSP_T *rcv_buf);
 int get_cmd_status(NCSI_NL_RSP_T *rcv_buf);
 void print_ncsi_resp(NCSI_NL_RSP_T *rcv_buf);
@@ -312,6 +345,7 @@ void print_get_parameters(NCSI_NL_RSP_T *rcv_buf);
 void print_ncsi_controller_stats(NCSI_NL_RSP_T *rcv_buf);
 void print_ncsi_stats(NCSI_NL_RSP_T *rcv_buf);
 void print_passthrough_stats(NCSI_NL_RSP_T *rcv_buf);
+void print_link_status(NCSI_NL_RSP_T *rcv_buf);
 int handle_get_link_status(NCSI_Response_Packet *resp);
 int handle_get_version_id(NCSI_Response_Packet *resp);
 

@@ -32,10 +32,11 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include "pal.h"
+#include "pal_sensors.h"
 #include <openbmc/misc-utils.h>
 #include <openbmc/vr.h>
 #include <openbmc/obmc-i2c.h>
-#include <openbmc/obmc-sensor.h>
+#include <openbmc/obmc-sensors.h>
 #include <sys/stat.h>
 #include <openbmc/libgpio.h>
 #include <openbmc/kv.h>
@@ -77,30 +78,10 @@
 #define CRASHDUMP_FILE      "/mnt/data/crashdump_"
 
 #define LARGEST_DEVICE_NAME 120
-#define PWM_DIR "/sys/devices/platform/ast_pwm_tacho.0"
-#define PWM_UNIT_MAX 96
 
-#define FAN0_TACH_INPUT 0
-#define FAN1_TACH_INPUT 2
 
-#define TACH_DIR "/sys/devices/platform/ast_pwm_tacho.0"
-#define ADC_DIR "/sys/devices/platform/ast_adc.0"
-
-#define EEPROM_RISER     "/sys/devices/platform/ast-i2c.1/i2c-1/1-0050/eeprom"
-#define EEPROM_RETIMER   "/sys/devices/platform/ast-i2c.3/i2c-3/3-0055/eeprom"
-
-#define MB_INLET_TEMP_DEVICE "/sys/devices/platform/ast-i2c.6/i2c-6/6-004e/hwmon/hwmon*"
-#define MB_OUTLET_TEMP_DEVICE "/sys/devices/platform/ast-i2c.6/i2c-6/6-004f/hwmon/hwmon*"
-#define MEZZ_TEMP_DEVICE "/sys/devices/platform/ast-i2c.8/i2c-8/8-001f/hwmon/hwmon*"
-#define HSC_DEVICE "/sys/devices/platform/ast-i2c.7/i2c-7/7-0011/hwmon/hwmon*"
-
-#define FAN_TACH_RPM "tacho%d_rpm"
-#define ADC_VALUE "adc%d_value"
-#define HSC_IN_VOLT "in1_input"
-#define HSC_OUT_CURR "curr1_input"
-#define HSC_TEMP "temp1_input"
-
-#define UNIT_DIV 1000
+#define EEPROM_RISER     "/sys/bus/i2c/devices/1-0050/eeprom"
+#define EEPROM_RETIMER   "/sys/bus/i2c/devices/3-0054/eeprom"
 
 #define MAX_SENSOR_NUM 0xFF
 #define ALL_BYTES 0xFF
@@ -111,23 +92,36 @@
 #define GUID_SIZE 16
 #define OFFSET_SYS_GUID 0x17F0
 #define OFFSET_DEV_GUID 0x1800
-#define FRU_EEPROM "/sys/devices/platform/ast-i2c.6/i2c-6/6-0054/eeprom"
+#define FRU_EEPROM     "/sys/bus/i2c/devices/6-0054/eeprom"
 
 #define READING_NA -2
 #define READING_SKIP 1
 
 #define NIC_MAX_TEMP 125
 #define NIC_MIN_TEMP  0
-#define PLAT_ID_SKU_MASK 0x10 // BIT4: 0- Single Side, 1- Double Side
 
 #define MAX_READ_RETRY 10
-#define POST_CODE_FILE       "/sys/devices/platform/ast-snoop-dma.0/data_history"
 
 #define CPLD_BUS_ID 0x6
 #define CPLD_ADDR 0xA0
 
+#define BIOS_VER_REGION_SIZE (4*1024*1024)
+#define BIOS_ERASE_PKT_SIZE  (64*1024)
+
+#define NUM_SERVER_FRU  1
+#define NUM_NIC_FRU     1
+#define NUM_BMC_FRU     1
+
+
 const char pal_fru_list[] = "all, mb, nic, riser_slot2, riser_slot3, riser_slot4";
 const char pal_server_list[] = "mb";
+const char *pal_server_fru_list[NUM_SERVER_FRU] = {"mb"};
+const char *pal_nic_fru_list[NUM_NIC_FRU] = {"nic"};
+const char *pal_bmc_fru_list[NUM_BMC_FRU] = {"bmc"};
+
+size_t server_fru_cnt = NUM_SERVER_FRU;
+size_t nic_fru_cnt  = NUM_NIC_FRU;
+size_t bmc_fru_cnt  = NUM_BMC_FRU;
 
 size_t pal_pwm_cnt = 2;
 size_t pal_tach_cnt = 2;
@@ -136,10 +130,6 @@ const char pal_tach_list[] = "0, 1";
 
 static uint8_t g_plat_id = 0x0;
 static uint8_t postcodes_last[256] = {0};
-
-static int key_func_por_policy (int event, void *arg);
-static int key_func_lps (int event, void *arg);
-static int key_func_ntp (int event, void *arg);
 
 enum key_event {
   KEY_BEFORE_SET,
@@ -152,16 +142,16 @@ struct pal_key_cfg {
   int (*function)(int, void*);
 } key_cfg[] = {
   /* name, default value, function */
-  {"pwr_server_last_state", "on", key_func_lps},
+  {"pwr_server_last_state", "on", NULL},
   {"sysfw_ver_server", "0", NULL},
   {"identify_sled", "off", NULL},
   {"timestamp_sled", "0", NULL},
-  {"server_por_cfg", "lps", key_func_por_policy},
+  {"server_por_cfg", "lps", NULL},
   {"server_sensor_health", "1", NULL},
   {"nic_sensor_health", "1", NULL},
   {"server_sel_error", "1", NULL},
   {"server_boot_order", "0100090203ff", NULL},
-  {"ntp_server", "", key_func_ntp},
+  {"ntp_server", "", NULL},
   /* Add more Keys here */
   {LAST_KEY, LAST_KEY, NULL} /* This is the last key of the list */
 };
@@ -293,7 +283,9 @@ static void init_mux_data_riser_mux(void) {
   flock(fd, LOCK_EX);
 
   fstat(fd, &st);
-  ftruncate(fd, sizeof(struct mux_shm));
+  if (ftruncate(fd, sizeof(struct mux_shm)) != 0) {
+    syslog(LOG_ERR, "Setting size of SHM failed!\n");
+  }
   riser_mux.shm = (struct mux_shm *)mmap(NULL, sizeof(struct mux_shm),
     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
@@ -649,6 +641,7 @@ const uint8_t mb_sensor_list[] = {
   MB_SENSOR_CONN_P12V_INA230_VOL,
   MB_SENSOR_CONN_P12V_INA230_CURR,
   MB_SENSOR_CONN_P12V_INA230_PWR,
+  MB_SENSOR_HOST_BOOT_TEMP,
 };
 
 // List of NIC sensors to be monitored
@@ -990,6 +983,9 @@ sensor_thresh_array_init() {
   mb_sensor_threshold[MB_SENSOR_VR_PCH_P1V05_VOLT][LCR_THRESH] = 0.94;
   mb_sensor_threshold[MB_SENSOR_VR_PCH_P1V05_VOLT][UCR_THRESH] = 1.15;
 
+  // Set when required
+  // mb_sensor_threshold[MB_SENSOR_HOST_BOOT_TEMP][UCR_THRESH] = 100;
+
   riser_slot2_sensor_threshold[MB_SENSOR_C2_NVME_CTEMP][UCR_THRESH] = 75;
   riser_slot3_sensor_threshold[MB_SENSOR_C3_NVME_CTEMP][UCR_THRESH] = 75;
   riser_slot4_sensor_threshold[MB_SENSOR_C4_NVME_CTEMP][UCR_THRESH] = 75;
@@ -1033,267 +1029,31 @@ sensor_thresh_array_init() {
   init_board_sensors();
   init_done = true;
 }
-
 static int
-read_device(const char *device, int *value) {
-  FILE *fp;
-  int rc;
-
-  fp = fopen(device, "r");
-  if (!fp) {
-    int err = errno;
-#ifdef DEBUG
-    syslog(LOG_INFO, "failed to open device %s", device);
-#endif
-    return err;
-  }
-
-  rc = fscanf(fp, "%d", value);
-  fclose(fp);
-  if (rc != 1) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "failed to read device %s", device);
-#endif
-    return ENOENT;
-  } else {
-    return 0;
-  }
-}
-
-static int
-read_device_float(const char *device, float *value) {
-  FILE *fp;
-  int rc;
-  char tmp[10];
-
-  fp = fopen(device, "r");
-  if (!fp) {
-    int err = errno;
-#ifdef DEBUG
-    syslog(LOG_INFO, "failed to open device %s", device);
-#endif
-    return err;
-  }
-
-  rc = fscanf(fp, "%s", tmp);
-  fclose(fp);
-
-  if (rc != 1) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "failed to read device %s", device);
-#endif
-    return ENOENT;
-  }
-
-  *value = atof(tmp);
-
-  return 0;
-}
-
-static int
-read_device_hex(const char *device, int *value) {
-  FILE *fp;
-  int rc;
-
-  fp = fopen(device, "r");
-  if (!fp) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "failed to open device %s", device);
-#endif
-    return errno;
-  }
-
-  rc = fscanf(fp, "%x", value);
-  fclose(fp);
-  if (rc != 1) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "failed to read device %s", device);
-#endif
-    return ENOENT;
-  } else {
-    return 0;
-  }
-}
-
-static int
-write_device(const char *device, const char *value) {
-  FILE *fp;
-  int rc;
-
-  fp = fopen(device, "w");
-  if (!fp) {
-    int err = errno;
-#ifdef DEBUG
-    syslog(LOG_INFO, "failed to open device for write %s", device);
-#endif
-    return err;
-  }
-
-  rc = fputs(value, fp);
-  fclose(fp);
-
-  if (rc < 0) {
-#ifdef DEBUG
-    syslog(LOG_INFO, "failed to write device %s", device);
-#endif
-    return ENOENT;
-  } else {
-    return 0;
-  }
-}
-
-static int
-read_temp_attr(uint8_t sensor_num, const char *device, const char *attr, float *value) {
-  char full_name[LARGEST_DEVICE_NAME + 1];
-  char dir_name[LARGEST_DEVICE_NAME + 1];
-  int tmp;
-  FILE *fp;
-  int size;
-  static unsigned int retry[4] = {0};
-  uint8_t i_retry = -1;
-
-  switch(sensor_num) {
-    case MB_SENSOR_INLET_TEMP:
-      i_retry = 0; break;
-    case MB_SENSOR_OUTLET_TEMP:
-      i_retry = 1; break;
-    case MB_SENSOR_INLET_REMOTE_TEMP:
-      i_retry = 2; break;
-    case MB_SENSOR_OUTLET_REMOTE_TEMP:
-      i_retry = 3; break;
-    default:
-      break;
-  }
-
-  // Get current working directory
-  snprintf(
-      full_name, LARGEST_DEVICE_NAME, "cd %s;pwd", device);
-
-  fp = popen(full_name, "r");
-  fgets(dir_name, LARGEST_DEVICE_NAME, fp);
-  pclose(fp);
-
-  // Remove the newline character at the end
-  size = strlen(dir_name);
-  dir_name[size-1] = '\0';
-
-  snprintf(
-      full_name, LARGEST_DEVICE_NAME, "%s/%s", dir_name, attr);
-
-  if (read_device(full_name, &tmp)) {
-    return -1;
-  }
-
-  *value = ((float)tmp)/UNIT_DIV;
-  if( i_retry != -1) {
-    if( ( *value > mb_sensor_threshold[sensor_num][UCR_THRESH]  || *value < 0 ) && retry[i_retry] < 5) {
-      retry[i_retry]++;
-      return READING_SKIP;
-    } else {
-      retry[i_retry] = 0;
-    }
-  }
-
-  return 0;
-}
-
-static int
-read_temp(uint8_t sensor_num, const char *device, float *value) {
-  return read_temp_attr(sensor_num, device, "temp1_input", value);
-}
-
-static int
-read_nic_temp(const char *device, float *value) {
-  char full_name[LARGEST_DEVICE_NAME + 1];
-  char dir_name[LARGEST_DEVICE_NAME + 1];
-  int tmp;
-  FILE *fp;
-  int size;
-  int ret = 0;
+read_nic_temp(float *value)
+{
   static unsigned int retry = 0;
-
-  // Get current working directory
-  snprintf(
-      full_name, LARGEST_DEVICE_NAME, "cd %s;pwd", device);
-
-  fp = popen(full_name, "r");
-  fgets(dir_name, LARGEST_DEVICE_NAME, fp);
-  pclose(fp);
-
-  // Remove the newline character at the end
-  size = strlen(dir_name);
-  dir_name[size-1] = '\0';
-
-  snprintf(
-      full_name, LARGEST_DEVICE_NAME, "%s/temp2_input", dir_name);
-
-  if (read_device(full_name, &tmp)) {
-    ret = READING_NA;
-  }
-
-  *value = ((float)tmp)/UNIT_DIV;
-
+  int ret = sensors_read("tmp421-i2c-8-1f", "MEZZ_SENSOR_TEMP", value);
   // Workaround: handle when NICs wrongly report higher temperatures
-  if (( *value > NIC_MAX_TEMP ) || ( *value < NIC_MIN_TEMP )) {
+  if (ret || ( *value > NIC_MAX_TEMP ) || ( *value < NIC_MIN_TEMP )) {
     ret = READING_NA;
   } else {
     retry = 0;
   }
-
   if (ret == READING_NA && ++retry <= 3)
     ret = READING_SKIP;
-
   return ret;
-
 }
 
 static int
-read_fan_value(const int fan, const char *device, int *value) {
-  char device_name[LARGEST_DEVICE_NAME];
-  char full_name[LARGEST_DEVICE_NAME];
-
-  snprintf(device_name, LARGEST_DEVICE_NAME, device, fan);
-  snprintf(full_name, LARGEST_DEVICE_NAME, "%s/%s", TACH_DIR, device_name);
-  return read_device(full_name, value);
-}
-
-static int
-read_fan_value_f(const int fan, const char *device, float *value) {
-  char device_name[LARGEST_DEVICE_NAME];
-  char full_name[LARGEST_DEVICE_NAME];
-  int ret;
-
-  snprintf(device_name, LARGEST_DEVICE_NAME, device, fan);
-  snprintf(full_name, LARGEST_DEVICE_NAME, "%s/%s", TACH_DIR, device_name);
-  ret = read_device_float(full_name, value);
-  if (*value < 500 || *value > mb_sensor_threshold[MB_SENSOR_FAN0_TACH][UCR_THRESH]) {
+read_fan_value(const char *fan, float *value)
+{
+  int ret = sensors_read_fan(fan, value);
+  if (ret || *value < 500 || *value > mb_sensor_threshold[MB_SENSOR_FAN0_TACH][UCR_THRESH]) {
     sleep(2);
-    ret = read_device_float(full_name, value);
+    ret = sensors_read_fan(fan, value);
   }
-
   return ret;
-}
-
-static int
-write_fan_value(const int fan, const char *device, const int value) {
-  char full_name[LARGEST_DEVICE_NAME];
-  char device_name[LARGEST_DEVICE_NAME];
-  char output_value[LARGEST_DEVICE_NAME];
-
-  snprintf(device_name, LARGEST_DEVICE_NAME, device, fan);
-  snprintf(full_name, LARGEST_DEVICE_NAME, "%s/%s", PWM_DIR, device_name);
-  snprintf(output_value, LARGEST_DEVICE_NAME, "%d", value);
-  return write_device(full_name, output_value);
-}
-
-static int
-read_adc_value(const int pin, const char *device, float *value) {
-  char device_name[LARGEST_DEVICE_NAME];
-  char full_name[LARGEST_DEVICE_NAME];
-
-  snprintf(device_name, LARGEST_DEVICE_NAME, device, pin);
-  snprintf(full_name, LARGEST_DEVICE_NAME, "%s/%s", ADC_DIR, device_name);
-  return read_device_float(full_name, value);
 }
 
 static int
@@ -3071,127 +2831,6 @@ pal_set_key_value(char *key, char *value) {
   return kv_set(key, value, 0, KV_FPERSIST);
 }
 
-static int fw_getenv(char *key, char *value)
-{
-  char cmd[MAX_KEY_LEN + 32] = {0};
-  char *p;
-  FILE *fp;
-
-  sprintf(cmd, "/sbin/fw_printenv -n %s", key);
-  fp = popen(cmd, "r");
-  if (!fp) {
-    return -1;
-  }
-  if (fgets(value, MAX_VALUE_LEN, fp) == NULL) {
-    pclose(fp);
-    return -1;
-  }
-  for (p = value; *p != '\0'; p++) {
-    if (*p == '\n' || *p == '\r') {
-      *p = '\0';
-      break;
-    }
-  }
-  pclose(fp);
-  return 0;
-}
-
-static void fw_setenv(char *key, char *value)
-{
-  char old_value[MAX_VALUE_LEN] = {0};
-  if (fw_getenv(key, old_value) != 0 ||
-      strcmp(old_value, value) != 0) {
-    /* Set the env key:value if either the key
-     * does not exist or the value is different from
-     * what we want set */
-    char cmd[MAX_VALUE_LEN] = {0};
-    snprintf(cmd, MAX_VALUE_LEN, "/sbin/fw_setenv %s %s", key, value);
-    system(cmd);
-  }
-}
-
-static int
-key_func_por_policy (int event, void *arg)
-{
-  char value[MAX_VALUE_LEN] = {0};
-
-  switch (event) {
-    case KEY_BEFORE_SET:
-      if (pal_is_fw_update_ongoing(FRU_MB))
-        return -1;
-      // sync to env
-      if ( !strcmp(arg,"lps") || !strcmp(arg,"on") || !strcmp(arg,"off")) {
-        fw_setenv("por_policy", (char *)arg);
-      }
-      else
-        return -1;
-      break;
-    case KEY_AFTER_INI:
-      // sync to env
-      kv_get("server_por_cfg", value, NULL, KV_FPERSIST);
-      fw_setenv("por_policy", value);
-      break;
-  }
-
-  return 0;
-}
-
-static int
-key_func_lps (int event, void *arg)
-{
-  char value[MAX_VALUE_LEN] = {0};
-
-  switch (event) {
-    case KEY_BEFORE_SET:
-      if (pal_is_fw_update_ongoing(FRU_MB))
-        return -1;
-      fw_setenv("por_ls", (char *)arg);
-      break;
-    case KEY_AFTER_INI:
-      kv_get("pwr_server_last_state", value, NULL, KV_FPERSIST);
-      fw_setenv("por_ls", value);
-      break;
-  }
-
-  return 0;
-}
-
-static int
-key_func_ntp (int event, void *arg)
-{
-  char cmd[MAX_VALUE_LEN] = {0};
-  char ntp_server_new[MAX_VALUE_LEN] = {0};
-  char ntp_server_old[MAX_VALUE_LEN] = {0};
-
-  switch (event) {
-    case KEY_BEFORE_SET:
-      // Remove old NTP server
-      kv_get("ntp_server", ntp_server_old, NULL, KV_FPERSIST);
-      if (strlen(ntp_server_old) > 2) {
-        snprintf(cmd, MAX_VALUE_LEN, "sed -i '/^restrict %s$/d' /etc/ntp.conf", ntp_server_old);
-        system(cmd);
-        snprintf(cmd, MAX_VALUE_LEN, "sed -i '/^server %s$/d' /etc/ntp.conf", ntp_server_old);
-        system(cmd);
-      }
-      // Add new NTP server
-      snprintf(ntp_server_new, MAX_VALUE_LEN, "%s", (char *)arg);
-      if (strlen(ntp_server_new) > 2) {
-        snprintf(cmd, MAX_VALUE_LEN, "echo \"restrict %s\" >> /etc/ntp.conf", ntp_server_new);
-        system(cmd);
-        snprintf(cmd, MAX_VALUE_LEN, "echo \"server %s\" >> /etc/ntp.conf", ntp_server_new);
-        system(cmd);
-      }
-      // Restart NTP server
-      snprintf(cmd, MAX_VALUE_LEN, "/etc/init.d/ntpd restart > /dev/null &");
-      system(cmd);
-      break;
-    case KEY_AFTER_INI:
-      break;
-  }
-
-  return 0;
-}
-
 static void
 FORCE_ADR() {
   char key[MAX_KEY_LEN] = {0};
@@ -3228,7 +2867,7 @@ bail:
 
 // Power Button Override
 int
-pal_PBO(void) {
+pal_power_button_override(uint8_t fruid) {
   int ret = -1;
   gpio_desc_t *gpio = gpio_open_by_shadow("FM_BMC_PWRBTN_OUT_N");
   if (!gpio) {
@@ -3269,9 +2908,12 @@ server_power_on(void) {
   if (gpio_set_value(gpio, GPIO_VALUE_HIGH)) {
     goto bail;
   }
-  ret = 0;
   sleep(2);
-  system("/usr/bin/sv restart fscd >> /dev/null");
+  if (system("/usr/bin/sv restart fscd >> /dev/null") != 0) {
+    syslog(LOG_CRIT, "FSCD Restart failed\n");
+    goto bail;
+  }
+  ret = 0;
 bail:
   gpio_close(gpio);
   return ret;
@@ -3287,7 +2929,10 @@ server_power_off(bool gs_flag) {
     return -1;
   }
 
-  system("/usr/bin/sv stop fscd >> /dev/null");
+  if (system("/usr/bin/sv stop fscd >> /dev/null") != 0) {
+    syslog(LOG_CRIT, "FSCD Stop on server power-off failed\n");
+    // Still go ahead in power-off
+  }
 
   if (!gs_flag)
     FORCE_ADR();
@@ -3381,11 +3026,12 @@ pal_is_fru_prsnt(uint8_t fru, uint8_t *status) {
       *status = 1;
       break;
     case FRU_NIC:
-      snprintf(full_name, LARGEST_DEVICE_NAME, "%s", "/sys/devices/platform/ast-i2c.8/i2c-8/8-001f/hwmon");
+      snprintf(full_name, LARGEST_DEVICE_NAME, "%s", "/sys/bus/i2c/devices/8-001f/hwmon");
       fp = fopen(full_name, "r");
       if (!fp) {
         return -1;
       }
+      fclose(fp);
       *status = 1;
       break;
     case FRU_RISER_SLOT2:
@@ -3544,8 +3190,10 @@ pal_set_server_power(uint8_t fru, uint8_t cmd) {
 int
 pal_sled_cycle(void) {
   // Send command to HSC power cycle
-  system("i2cset -y 7 0x45 0xd9 c &> /dev/null");
-
+  if (system("i2cset -y 7 0x45 0xd9 c &> /dev/null") != 0) {
+    syslog(LOG_CRIT, "SLED Cycle failed\n");
+    return -1;
+  }
   return 0;
 }
 
@@ -3587,7 +3235,7 @@ pal_set_rst_btn(uint8_t slot, uint8_t status) {
 }
 
 // Update the LED for the given slot with the status
-int 
+int
 pal_set_sled_led(uint8_t fru, uint8_t status) {
   int ret = -1;
 
@@ -3618,7 +3266,10 @@ pal_set_hb_led(uint8_t status) {
 
   sprintf(cmd, "devmem 0x1e6c0064 32 %s", val);
 
-  system(cmd);
+  if (system(cmd) != 0) {
+    syslog(LOG_ERR, "Setting HB LED failed!\n");
+    return -1;
+  }
 
   return 0;
 }
@@ -3640,7 +3291,8 @@ check_postcodes(uint8_t fru_id, uint8_t sensor_num, float *value) {
   static int log_asserted = 0;
   const int loop_threshold = 3;
   const int longest_loop_code = 4;
-  int i, len, check_from, check_until;
+  size_t len;
+  int i, check_from, check_until;
   uint8_t buff[256];
   uint8_t location, maj_err, min_err, loop_convention;
   int ret = READING_NA, rc;
@@ -3659,7 +3311,7 @@ check_postcodes(uint8_t fru_id, uint8_t sensor_num, float *value) {
   }
 
   len = 0; // clear higher bits
-  rc = pal_get_80port_record(FRU_MB, NULL, 0, buff, (uint8_t *)&len);
+  rc = pal_get_80port_record(FRU_MB, buff, sizeof(buff), &len);
   if (rc != PAL_EOK)
     goto error_exit;
 
@@ -3755,7 +3407,8 @@ check_frb3(uint8_t fru_id, uint8_t sensor_num, float *value) {
   static time_t rst_time = 0;
   uint8_t postcodes[256] = {0};
   struct stat file_stat;
-  int ret = READING_NA, rc, len;
+  int ret = READING_NA, rc;
+  size_t len = 0;
   char sensor_name[32] = {0};
   char error[32] = {0};
 
@@ -3772,7 +3425,7 @@ check_frb3(uint8_t fru_id, uint8_t sensor_num, float *value) {
     // cache current postcode buffer
     if (stat("/tmp/DWR", &file_stat) != 0) {
       memset(postcodes_last, 0, sizeof(postcodes_last));
-      pal_get_80port_record(FRU_MB, NULL, 0, postcodes_last, (uint8_t *)&len);
+      pal_get_80port_record(FRU_MB, postcodes_last, sizeof(postcodes_last), &len);
     }
   }
 
@@ -3783,7 +3436,7 @@ check_frb3(uint8_t fru_id, uint8_t sensor_num, float *value) {
 
     // Port 80 updated
     memset(postcodes, 0, sizeof(postcodes));
-    rc = pal_get_80port_record(FRU_MB, NULL, 0, postcodes, (uint8_t *)&len);
+    rc = pal_get_80port_record(FRU_MB, postcodes, sizeof(postcodes), &len);
     if (rc == PAL_EOK && memcmp(postcodes_last, postcodes, 256) != 0) {
       frb3_fail = 0;
     }
@@ -4008,13 +3661,17 @@ pal_fruid_write(uint8_t fru, char *path)
       if ( PAL_EOK == ret )
       {
         pal_add_i2c_device(bus, device_name, device_addr);
-        system(command);
+        if (system(command) != 0) {
+          syslog(LOG_WARNING, "%s failed\n", command);
+        }
         //compare the in and out data
         ret=pal_compare_fru_data((char*)EEPROM_RISER, path, fru_size);
         if (ret < 0)
         {
           ret = PAL_ENOTSUP;
-          system("i2cdetect -y -q 1 > /tmp/AVA_FRU_FAIL.log");
+          if (system("i2cdetect -y -q 1 > /tmp/AVA_FRU_FAIL.log") != 0) {
+            syslog(LOG_ERR, "Gathering I2C detect failure log failed\n");
+          }
           syslog(LOG_ERR, "[%s] AVA FRU Write Fail", __func__);
         }
 
@@ -4028,12 +3685,16 @@ pal_fruid_write(uint8_t fru, char *path)
       if ( PAL_EOK == ret )
       {
         pal_add_i2c_device(bus, device_name, device_addr);
-        system(command);
+        if (system(command) != 0) {
+          syslog(LOG_ERR, "%s failed", command);
+        }
         ret = pal_compare_fru_data((char*)EEPROM_RETIMER, path, fru_size);
         if ( ret < 0 )
         {
           ret = PAL_ENOTSUP;
-          system("i2cdetect -y -q 3 > /tmp/RETIMER_FRU_FAIL.log");
+          if (system("i2cdetect -y -q 3 > /tmp/RETIMER_FRU_FAIL.log") != 0) {
+            syslog(LOG_ERR, "Gathering I2C detect failure log failed");
+          }
           syslog(LOG_ERR, "[%s] RETIMER FRU Write Fail", __func__);
         }
         pal_del_i2c_device(bus, device_addr);
@@ -4083,7 +3744,7 @@ read_battery_status(float *value)
     goto bail;
   }
   msleep(10);
-  ret = read_adc_value(ADC_PIN7, ADC_VALUE, value);
+  ret = sensors_read_adc("MB_P3V_BAT", value);
   gpio_set_value(gp_batt, GPIO_VALUE_HIGH);
 bail:
   gpio_close(gp_batt);
@@ -4114,33 +3775,33 @@ pal_sensor_read_raw(uint8_t fru, uint8_t sensor_num, void *value) {
       switch(sensor_num) {
       // Temp. Sensors
       case MB_SENSOR_INLET_TEMP:
-        ret = read_temp(MB_SENSOR_INLET_TEMP, MB_INLET_TEMP_DEVICE, (float*) value);
+        ret = sensors_read("tmp421-i2c-6-4e", "MB_INLET_TEMP", (float *)value);
         break;
       case MB_SENSOR_OUTLET_TEMP:
-        ret = read_temp(MB_SENSOR_OUTLET_TEMP, MB_OUTLET_TEMP_DEVICE, (float*) value);
+        ret = sensors_read("tmp421-i2c-6-4f", "MB_OUTLET_TEMP", (float *)value);
         break;
       case MB_SENSOR_INLET_REMOTE_TEMP:
-        ret = read_temp_attr(MB_SENSOR_INLET_REMOTE_TEMP, MB_INLET_TEMP_DEVICE, "temp2_input", (float*) value);
+        ret = sensors_read("tmp421-i2c-6-4e", "MB_INLET_REMOTE_TEMP", (float *)value);
         if (!ret)
           apply_inlet_correction((float *) value);
         break;
       case MB_SENSOR_OUTLET_REMOTE_TEMP:
-        ret = read_temp_attr(MB_SENSOR_OUTLET_REMOTE_TEMP, MB_OUTLET_TEMP_DEVICE, "temp2_input", (float*) value);
+        ret = sensors_read("tmp421-i2c-6-4f", "MB_OUTLET_REMOTE_TEMP", (float *)value);
         break;
       case MB_SENSOR_P12V:
-        ret = read_adc_value(ADC_PIN2, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P12V", (float *)value);
         break;
       case MB_SENSOR_P1V05:
-        ret = read_adc_value(ADC_PIN3, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P1V05", (float *)value);
         break;
       case MB_SENSOR_PVNN_PCH_STBY:
-        ret = read_adc_value(ADC_PIN4, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_PVNN_PCH_STBY", (float *)value);
         break;
       case MB_SENSOR_P3V3_STBY:
-        ret = read_adc_value(ADC_PIN5, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P3V3_STBY", (float *)value);
         break;
       case MB_SENSOR_P5V_STBY:
-        ret = read_adc_value(ADC_PIN6, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P5V_STBY", (float *)value);
         break;
       case MB_SENSOR_P3V_BAT:
         ret = read_battery_status((float *)value);
@@ -4180,47 +3841,47 @@ pal_sensor_read_raw(uint8_t fru, uint8_t sensor_num, void *value) {
       switch(sensor_num) {
       // Temp. Sensors
       case MB_SENSOR_INLET_TEMP:
-        ret = read_temp(MB_SENSOR_INLET_TEMP, MB_INLET_TEMP_DEVICE, (float*) value);
+        ret = sensors_read("tmp421-i2c-6-4e", "MB_INLET_TEMP", (float *)value);
         break;
       case MB_SENSOR_OUTLET_TEMP:
-        ret = read_temp(MB_SENSOR_OUTLET_TEMP, MB_OUTLET_TEMP_DEVICE, (float*) value);
+        ret = sensors_read("tmp421-i2c-6-4f", "MB_OUTLET_TEMP", (float *)value);
         break;
       case MB_SENSOR_INLET_REMOTE_TEMP:
-        ret = read_temp_attr(MB_SENSOR_INLET_REMOTE_TEMP, MB_INLET_TEMP_DEVICE, "temp2_input", (float*) value);
+        ret = sensors_read("tmp421-i2c-6-4e", "MB_INLET_REMOTE_TEMP", (float *)value);
         if (!ret)
           apply_inlet_correction((float *) value);
         break;
       case MB_SENSOR_OUTLET_REMOTE_TEMP:
-        ret = read_temp_attr(MB_SENSOR_OUTLET_REMOTE_TEMP, MB_OUTLET_TEMP_DEVICE, "temp2_input", (float*) value);
+        ret = sensors_read("tmp421-i2c-6-4f", "MB_OUTLET_REMOTE_TEMP", (float *)value);
         break;
       // Fan Sensors
       case MB_SENSOR_FAN0_TACH:
-        ret = read_fan_value_f(FAN0, FAN_TACH_RPM, (float*) value);
+        ret = read_fan_value("fan1", (float *)value);
         break;
       case MB_SENSOR_FAN1_TACH:
-        ret = read_fan_value_f(FAN1, FAN_TACH_RPM, (float*) value);
+        ret = read_fan_value("fan3", (float *)value);
         break;
       // Various Voltages
       case MB_SENSOR_P3V3:
-        ret = read_adc_value(ADC_PIN0, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P3V3", (float *)value);
         break;
       case MB_SENSOR_P5V:
-        ret = read_adc_value(ADC_PIN1, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P5V", (float *)value);
         break;
       case MB_SENSOR_P12V:
-        ret = read_adc_value(ADC_PIN2, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P12V", (float *)value);
         break;
       case MB_SENSOR_P1V05:
-        ret = read_adc_value(ADC_PIN3, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P1V05", (float *)value);
         break;
       case MB_SENSOR_PVNN_PCH_STBY:
-        ret = read_adc_value(ADC_PIN4, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_PVNN_PCH_STBY", (float *)value);
         break;
       case MB_SENSOR_P3V3_STBY:
-        ret = read_adc_value(ADC_PIN5, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P3V3_STBY", (float *)value);
         break;
       case MB_SENSOR_P5V_STBY:
-        ret = read_adc_value(ADC_PIN6, ADC_VALUE, (float*) value);
+        ret = sensors_read_adc("MB_P5V_STBY", (float *)value);
         break;
       case MB_SENSOR_P3V_BAT:
         ret = read_battery_status((float *)value);
@@ -4525,7 +4186,7 @@ pal_sensor_read_raw(uint8_t fru, uint8_t sensor_num, void *value) {
     sprintf(key, "nic_sensor%d", sensor_num);
     switch(sensor_num) {
     case MEZZ_SENSOR_TEMP:
-      ret = read_nic_temp(MEZZ_TEMP_DEVICE, (float*) value);
+      ret = read_nic_temp((float*) value);
       break;
     default:
       return -1;
@@ -4833,6 +4494,9 @@ pal_get_sensor_name(uint8_t fru, uint8_t sensor_num, char *name) {
     case MB_SENSOR_VR_PCH_P1V05_POWER:
       sprintf(name, "MB_VR_PCH_P1V05_POWER");
       break;
+    case MB_SENSOR_HOST_BOOT_TEMP:
+      sprintf(name, "MB_HOST_BOOT_TEMP");
+      break;
     case MB_SENSOR_C2_NVME_CTEMP:
       sprintf(name, "MB_C2_NVME_CTEMP");
       break;
@@ -4996,6 +4660,7 @@ pal_get_sensor_units(uint8_t fru, uint8_t sensor_num, char *units) {
     case MB_SENSOR_VR_CPU1_VDDQ_GRPD_TEMP:
     case MB_SENSOR_VR_PCH_PVNN_TEMP:
     case MB_SENSOR_VR_PCH_P1V05_TEMP:
+    case MB_SENSOR_HOST_BOOT_TEMP:
     case MB_SENSOR_C2_NVME_CTEMP:
     case MB_SENSOR_C3_NVME_CTEMP:
     case MB_SENSOR_C4_NVME_CTEMP:
@@ -5143,7 +4808,7 @@ int
 pal_get_fruid_eeprom_path(uint8_t fru, char *path) {
   switch(fru) {
   case FRU_MB:
-    sprintf(path, "/sys/devices/platform/ast-i2c.6/i2c-6/6-0054/eeprom");
+    sprintf(path, FRU_EEPROM);
     break;
   default:
     return -1;
@@ -5605,7 +5270,9 @@ pal_is_bmc_por(void) {
 
   fp = fopen("/tmp/ast_por", "r");
   if (fp != NULL) {
-    fscanf(fp, "%d", &por);
+    if (fscanf(fp, "%d", &por) != 1) {
+      return 0;
+    }
     fclose(fp);
   }
 
@@ -5688,14 +5355,20 @@ static void *dwr_handler(void *arg) {
     (res->data[7] & 0x04) == 0x04) { // DWR mode
     // System is in DWR mode
     syslog(LOG_WARNING, "Start DWR Autodump");
-    system("/usr/local/bin/autodump.sh --dwr &");
+    if (system("/usr/local/bin/autodump.sh --dwr &") != 0) {
+      syslog(LOG_ERR, "DWR autodump failed!\n");
+    }
   } else {
     syslog(LOG_WARNING, "Start Second Autodump");
-    system("/usr/local/bin/autodump.sh --second &");
+    if (system("/usr/local/bin/autodump.sh --second &") != 0) {
+      syslog(LOG_ERR, "Second autodump failed!\n");
+    }
   }
 #endif
   syslog(LOG_WARNING, "Start Second/DWR Autodump");
-  system("/usr/local/bin/autodump.sh --second &");
+  if (system("/usr/local/bin/autodump.sh --second &") != 0) {
+    syslog(LOG_ERR, "Autodump.sh --second failed!\n");
+  }
 
   tid_dwr = -1;
   pthread_exit(NULL);
@@ -5703,14 +5376,15 @@ static void *dwr_handler(void *arg) {
 
 void
 pal_second_crashdump_chk(void) {
-    int fd, len;
+    int fd;
+    size_t len;
 
     if (tid_dwr != -1)
       pthread_cancel(tid_dwr);
 
     if (pthread_create(&tid_dwr, NULL, dwr_handler, NULL) == 0) {
       memset(postcodes_last, 0, sizeof(postcodes_last));
-      pal_get_80port_record(FRU_MB, NULL, 0, postcodes_last, (uint8_t *)&len);
+      pal_get_80port_record(FRU_MB, postcodes_last, sizeof(postcodes_last), &len);
 
       fd =  creat("/tmp/DWR", 0644);
       if (fd)
@@ -5820,8 +5494,7 @@ pal_get_fan_name(uint8_t num, char *name) {
 
 int
 pal_set_fan_speed(uint8_t fan, uint8_t pwm) {
-  int unit;
-  int ret;
+  int ret = -1;
 
   if (fan >= pal_pwm_cnt) {
     syslog(LOG_INFO, "pal_set_fan_speed: fan number is invalid - %d", fan);
@@ -5833,60 +5506,29 @@ pal_set_fan_speed(uint8_t fan, uint8_t pwm) {
     return PAL_ENOTREADY;
   }
 
-  // Convert the percentage to our 1/96th unit.
-  unit = pwm * PWM_UNIT_MAX / 100;
-
-  // For 0%, turn off the PWM entirely
-  if (unit == 0) {
-    ret = write_fan_value(fan, "pwm%d_en", 0);
-    if (ret < 0) {
-      syslog(LOG_INFO, "set_fan_speed: write_fan_value failed");
-      return -1;
-    }
-    return 0;
-
-  // For 100%, set falling and rising to the same value
-  } else if (unit == PWM_UNIT_MAX) {
-    unit = 0;
+  if (fan == 0) {
+    ret = sensors_write_fan("pwm1", (float)pwm);
+  } else if (fan == 1) {
+    ret = sensors_write_fan("pwm2", (float)pwm);
   }
-
-  ret = write_fan_value(fan, "pwm%d_type", 0);
-  if (ret < 0) {
-    syslog(LOG_INFO, "set_fan_speed: write_fan_value failed");
-    return -1;
-  }
-
-  ret = write_fan_value(fan, "pwm%d_rising", 0);
-  if (ret < 0) {
-    syslog(LOG_INFO, "set_fan_speed: write_fan_value failed");
-    return -1;
-  }
-
-  ret = write_fan_value(fan, "pwm%d_falling", unit);
-  if (ret < 0) {
-    syslog(LOG_INFO, "set_fan_speed: write_fan_value failed");
-    return -1;
-  }
-
-  ret = write_fan_value(fan, "pwm%d_en", 1);
-  if (ret < 0) {
-    syslog(LOG_INFO, "set_fan_speed: write_fan_value failed");
-    return -1;
-  }
-
-  return 0;
+  return ret;
 }
 
 int
 pal_get_fan_speed(uint8_t fan, int *rpm) {
+  int ret;
+  float value = 0.0;
+
   if (fan == 0) {
-    return read_fan_value(FAN0_TACH_INPUT, "tacho%d_rpm", rpm);
+    ret = sensors_read_fan("fan1", &value);
   } else if (fan == 1) {
-    return read_fan_value(FAN1_TACH_INPUT, "tacho%d_rpm", rpm);
+    ret = sensors_read_fan("fan3", &value);
   } else {
     syslog(LOG_INFO, "get_fan_speed: invalid fan#:%d", fan);
     return -1;
   }
+  *rpm = (int)value;
+  return ret;
 }
 
 void
@@ -5954,32 +5596,10 @@ pal_get_board_id(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_
   return completion_code;
 }
 
-static int
-get_gpio_shadow_array(const char **shadows, int num, uint8_t *mask)
-{
-  int i;
-  *mask = 0;
-  for (i = 0; i < num; i++) {
-    int ret;
-    gpio_value_t value;
-    gpio_desc_t *gpio = gpio_open_by_shadow(shadows[i]);
-    if (!gpio) {
-      return -1;
-    }
-    ret = gpio_get_value(gpio, &value);
-    gpio_close(gpio);
-    if (ret != 0) {
-      return -1;
-    }
-    *mask |= (value == GPIO_VALUE_HIGH ? 1 : 0) << i;
-  }
-  return 0;
-}
-
 int
 pal_get_platform_id(uint8_t *id) {
   static bool cached = false;
-  static uint8_t cached_id = 0;
+  static unsigned int cached_id = 0;
 
   if (!cached) {
     const char *shadows[] = {
@@ -5989,19 +5609,19 @@ pal_get_platform_id(uint8_t *id) {
       "FM_BOARD_SKU_ID3",
       "FM_BOARD_SKU_ID4"
     };
-    if (get_gpio_shadow_array(shadows, ARRAY_SIZE(shadows), &cached_id)) {
+    if (gpio_get_value_by_shadow_list(shadows, ARRAY_SIZE(shadows), &cached_id)) {
       return -1;
     }
     cached = true;
   }
-  *id = cached_id;
+  *id = (uint8_t)cached_id;
   return 0;
 }
 
 int
 pal_get_board_rev_id(uint8_t *id) {
   static bool cached = false;
-  static uint8_t cached_id = 0;
+  static unsigned int cached_id = 0;
 
   if (!cached) {
     const char *shadows[] = {
@@ -6009,12 +5629,12 @@ pal_get_board_rev_id(uint8_t *id) {
       "FM_BOARD_REV_ID1",
       "FM_BOARD_REV_ID2"
     };
-    if (get_gpio_shadow_array(shadows, ARRAY_SIZE(shadows), &cached_id)) {
+    if (gpio_get_value_by_shadow_list(shadows, ARRAY_SIZE(shadows), &cached_id)) {
       return -1;
     }
     cached = true;
   }
-  *id = cached_id;
+  *id = (uint8_t)cached_id;
   return 0;
 }
 
@@ -6059,19 +5679,19 @@ pal_get_mb_slot_id(uint8_t *id) {
 int
 pal_get_slot_cfg_id(uint8_t *id) {
   static bool cached = false;
-  static uint8_t cached_id = 0;
+  static unsigned int cached_id = 0;
 
   if (!cached) {
     const char *shadows[] = {
       "FM_BOARD_SKU_ID5",
       "FM_BOARD_SKU_ID6"
     };
-    if (get_gpio_shadow_array(shadows, ARRAY_SIZE(shadows), &cached_id)) {
+    if (gpio_get_value_by_shadow_list(shadows, ARRAY_SIZE(shadows), &cached_id)) {
       return -1;
     }
     cached = true;
   }
-  *id = cached_id;
+  *id = (uint8_t)cached_id;
   return 0;
 }
 
@@ -6104,41 +5724,18 @@ pal_get_poss_pcie_config(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8
 
 int
 pal_get_pwm_value(uint8_t fan_num, uint8_t *value) {
-  char path[LARGEST_DEVICE_NAME] = {0};
-  char device_name[LARGEST_DEVICE_NAME] = {0};
-  int val = 0;
-  int pwm_enable = 0;
-
-  if (fan_num < 0 || fan_num >= pal_pwm_cnt) {
-    syslog(LOG_INFO, "pal_get_pwm_value: fan number is invalid - %d", fan_num);
-    return -1;
-  }
-
-  // Need check pwmX_en to determine the PWM is 0 or 100.
-  snprintf(device_name, LARGEST_DEVICE_NAME, "pwm%d_en", fan_num);
-  snprintf(path, LARGEST_DEVICE_NAME, "%s/%s", PWM_DIR, device_name);
-  if (read_device(path, &pwm_enable)) {
-    syslog(LOG_INFO, "pal_get_pwm_value: read %s failed", path);
-    return -1;
-  }
-
-  if(pwm_enable) {
-    snprintf(device_name, LARGEST_DEVICE_NAME, "pwm%d_falling", fan_num);
-    snprintf(path, LARGEST_DEVICE_NAME, "%s/%s", PWM_DIR, device_name);
-    if (read_device_hex(path, &val)) {
-      syslog(LOG_INFO, "pal_get_pwm_value: read %s failed", path);
-      return -1;
-    }
-
-    if(val == 0)
-      *value = 100;
-    else
-      *value = (100 * val + (PWM_UNIT_MAX-1)) / PWM_UNIT_MAX;
+  int ret;
+  float val;
+  if (fan_num == 0) {
+    ret = sensors_read_fan("pwm1", &val);
+  } else if (fan_num == 1) {
+    ret = sensors_read_fan("pwm2", &val);
   } else {
-    *value = 0;
+    return -1;
   }
-
-  return 0;
+  if (!ret)
+    *value = (uint8_t)val;
+  return ret;
 }
 
 int
@@ -6158,14 +5755,14 @@ pal_fan_recovered_handle(int fan_num) {
 static bool
 is_cpu_socket_occupy(unsigned int cpu_idx) {
   static bool cached = false;
-  static uint8_t cached_id = 0;
+  static unsigned int cached_id = 0;
 
   if (!cached) {
     const char *shadows[] = {
       "FM_CPU0_SKTOCC_LVT3_N",
       "FM_CPU1_SKTOCC_LVT3_N"
     };
-    if (get_gpio_shadow_array(shadows, ARRAY_SIZE(shadows), &cached_id)) {
+    if (gpio_get_value_by_shadow_list(shadows, ARRAY_SIZE(shadows), &cached_id)) {
       return false;
     }
     cached = true;
@@ -6351,7 +5948,9 @@ pal_set_post_end(uint8_t slot, uint8_t *req_data, uint8_t *res_data, uint8_t *re
   syslog (LOG_INFO, "POST End Event for Payload#%d\n", slot);
 
   // Sync time with system
-  system("/usr/local/bin/sync_date.sh &");
+  if (system("/usr/local/bin/sync_date.sh &") != 0) {
+    syslog(LOG_ERR, "Sync date failed!\n");
+  }
 }
 
 int
@@ -6586,43 +6185,6 @@ pal_sensor_sts_check(uint8_t snr_num, float val, uint8_t *thresh) {
 }
 
 int
-pal_get_80port_record(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len)
-{
-  FILE *fp=NULL;
-  int i;
-  unsigned char postcode;
-
-  if (res_data == NULL)
-    return -1;
-
-  if (slot != FRU_MB) {
-    syslog(LOG_WARNING, "pal_get_80port_record: slot %d is not supported", slot);
-    return PAL_ENOTSUP;
-  }
-
-  fp = fopen(POST_CODE_FILE, "r");
-  if (fp == NULL) {
-    syslog(LOG_WARNING, "pal_get_80port_record: Cannot open %s", POST_CODE_FILE);
-    return PAL_ENOTSUP;
-  }
-
-  for (i=0; i<256; i++) {
-    // %hhx: unsigned char*
-    if (fscanf(fp, "%hhx", &postcode) == 1) {
-      res_data[i] = postcode;
-    } else {
-      break;
-    }
-  }
-  if (res_len)
-    *(unsigned short *)res_len = i;
-
-  fclose(fp);
-
-  return PAL_EOK;
-}
-
-int
 pal_set_ppin_info(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len)
 {
   char key[MAX_KEY_LEN] = {0};
@@ -6677,7 +6239,9 @@ pal_get_syscfg_text (char *text) {
       key_prefix, index);
     if (kv_get(key, value, &ret, KV_FPERSIST) == 0 && ret >= 26) {
       // Read 4 bytes Processor#
-      snprintf(&entry[strlen(entry)], 5, "%s", &value[22]);
+      if (snprintf(&entry[strlen(entry)], 5, "%s", &value[22]) > 5) {
+        syslog(LOG_ERR, "%s: CPU processor ID truncation detected!\n", __func__);
+      }
     }
 
     // Frequency & Core Number
@@ -6852,7 +6416,10 @@ int pal_add_i2c_device(uint8_t bus, char *device_name, uint8_t slave_addr)
   syslog(LOG_WARNING, "[%s] Cmd: %s", __func__, cmd);
 #endif
 
-  system(cmd);
+  ret = system(cmd);
+  if (ret != 0) {
+    syslog(LOG_ERR, "Adding I2C device %d:%d:%s failed\n", bus, slave_addr, device_name);
+  }
 
   return ret;
 }
@@ -6869,7 +6436,10 @@ int pal_del_i2c_device(uint8_t bus, uint8_t slave_addr)
   syslog(LOG_WARNING, "[%s] Cmd: %s", __func__, cmd);
 #endif
 
-  system(cmd);
+  ret = system(cmd);
+  if (ret != 0) {
+    syslog(LOG_ERR, "Deleting I2C device %d:%d failed\n", bus, slave_addr);
+  }
 
   return ret;
 }
@@ -7203,7 +6773,7 @@ int
 pal_uart_switch_for_led_ctrl (void)
 {
   static uint32_t pre_channel = 0xffffffff;
-  uint8_t vals;
+  unsigned int vals;
   uint32_t channel = 0;
   const char *shadows[] = {
     "FM_UARTSW_LSB_N",
@@ -7213,7 +6783,7 @@ pal_uart_switch_for_led_ctrl (void)
   //UART Switch control by bmc
   pal_mmap (AST_GPIO_BASE, UARTSW_OFFSET, UARTSW_BY_BMC, 0);
 
-  if (get_gpio_shadow_array(shadows, ARRAY_SIZE(shadows), &vals)) {
+  if (gpio_get_value_by_shadow_list(shadows, ARRAY_SIZE(shadows), &vals)) {
     return -1;
   }
   // The GPIOs are active-low. So, invert it.
@@ -7509,6 +7079,15 @@ bool pal_sensor_is_valid(char *fru_name, char *sensor_name)
   }
 
   return true;
+}
+
+bool
+pal_sensor_is_source_host(uint8_t fru, uint8_t sensor_id)
+{
+  if (fru == FRU_MB && sensor_id == MB_SENSOR_HOST_BOOT_TEMP) {
+    return true;
+  }
+  return false;
 }
 
 int

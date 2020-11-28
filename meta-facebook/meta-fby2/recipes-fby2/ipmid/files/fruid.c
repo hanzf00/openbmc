@@ -41,11 +41,14 @@
 #include <facebook/fby2_fruid.h>
 #include <openbmc/pal.h>
 #include <openbmc/ncsi.h>
+#include <openbmc/nl-wrapper.h>
 
 #define EEPROM_DC       "/sys/class/i2c-adapter/i2c-%d/%d-0051/eeprom"
 
 #if defined(CONFIG_FBY3_POC)
-#define EEPROM_SPB      "/sys/class/i2c-adapter/i2c-10/10-0051/eeprom"
+#define EEPROM_SPB      "/sys/class/i2c-adapter/i2c-11/11-0051/eeprom"
+#elif defined(CONFIG_FBY2_KERNEL)
+#define EEPROM_SPB      "/sys/bus/i2c/devices/8-0051/eeprom"
 #else
 #define EEPROM_SPB      "/sys/class/i2c-adapter/i2c-8/8-0051/eeprom"
 #endif
@@ -70,54 +73,107 @@
  * @bin_file      : path for the binary file
  *
  * returns 0 on successful copy
- * returns non-zero on file operation errors
+ * returns -1 on file operation errors
  */
 static int copy_eeprom_to_bin(const char * eeprom_file, const char * bin_file) {
 
-  int eeprom;
-  int bin;
-  uint64_t tmp[FRUID_SIZE];
-  ssize_t bytes_rd, bytes_wr;
+  int eeprom = 0;
+  int bin = 0;
+  int ret = 0;
+  uint8_t tmp[FRUID_SIZE] = {0};
+  ssize_t bytes_rd = 0, bytes_wr = 0;
 
   errno = 0;
 
   if (access(eeprom_file, F_OK) != -1) {
 
     eeprom = open(eeprom_file, O_RDONLY);
-    if (eeprom == -1) {
+    if (eeprom < 0) {
       syslog(LOG_ERR, "copy_eeprom_to_bin: unable to open the %s file: %s",
           eeprom_file, strerror(errno));
-      return errno;
+      return -1;
     }
 
     bin = open(bin_file, O_WRONLY | O_CREAT, 0644);
-    if (bin == -1) {
+    if (bin < 0) {
       syslog(LOG_ERR, "copy_eeprom_to_bin: unable to create %s file: %s",
           bin_file, strerror(errno));
-      return errno;
+      ret = -1;
+      goto err;
     }
 
     bytes_rd = read(eeprom, tmp, FRUID_SIZE);
     if (bytes_rd != FRUID_SIZE) {
       syslog(LOG_ERR, "copy_eeprom_to_bin: write to %s file failed: %s",
           eeprom_file, strerror(errno));
-      return errno;
+      ret = -1;
+      goto exit;
     }
 
     bytes_wr = write(bin, tmp, bytes_rd);
     if (bytes_wr != bytes_rd) {
       syslog(LOG_ERR, "copy_eeprom_to_bin: write to %s file failed: %s",
           bin_file, strerror(errno));
-      return errno;
+      ret = -1;
     }
 
-    close(bin);
-    close(eeprom);
+    exit:
+      close(bin);
+    err:
+      close(eeprom);
   }
 
-  return 0;
+  return ret;
 }
 
+#if defined(CONFIG_FBY2_KERNEL)
+static int get_ncsi_vid() {
+  NCSI_NL_MSG_T *nl_msg;
+  NCSI_NL_RSP_T *nl_rsp;
+  char value[MAX_VALUE_LEN] = {0};
+  Get_Version_ID_Response *vidresp, *vidcache;
+  int ret = -1;
+  char *nic_key = "nic_fw_ver";
+
+  nl_msg = (NCSI_NL_MSG_T *)calloc(1, sizeof(NCSI_NL_MSG_T));
+  if (!nl_msg) {
+    syslog(LOG_WARNING, "%s: allocate nl_msg buffer failed", __func__);
+    return -1;
+  }
+
+  sprintf(nl_msg->dev_name, "eth0");
+  nl_msg->channel_id = 0;
+  nl_msg->cmd = NCSI_GET_VERSION_ID;
+  nl_msg->payload_length = 0;
+
+  do {
+    nl_rsp = send_nl_msg_libnl(nl_msg);
+    if (!nl_rsp) {
+      break;
+    }
+    if (((NCSI_Response_Packet *)nl_rsp->msg_payload)->Response_Code) {
+      break;
+    }
+
+    ret = kv_get(nic_key, value, NULL, 0);
+    vidcache = (Get_Version_ID_Response *)value;
+    vidresp = (Get_Version_ID_Response *)((NCSI_Response_Packet *)nl_rsp->msg_payload)->Payload_Data;
+    if (ret || memcmp(vidresp->fw_ver, vidcache->fw_ver, sizeof(vidresp->fw_ver))) {
+      if (!kv_set(nic_key, (const char *)vidresp, sizeof(Get_Version_ID_Response), 0)){
+        syslog(LOG_WARNING, "updated %s", nic_key);
+      }
+    }
+    ret = 0;
+  } while (0);
+
+  free(nl_msg);
+  if (nl_rsp) {
+    free(nl_rsp);
+  }
+
+  return ret;  
+}
+#else
 static int get_ncsi_vid(void) {
   int sock_fd, ret = 0;
   int req_msg_size = offsetof(NCSI_NL_MSG_T, msg_payload);
@@ -208,6 +264,7 @@ close_and_exit:
 
   return ret;
 }
+#endif
 
 int plat_fruid_init(void) {
 
@@ -324,14 +381,15 @@ int plat_fruid_data(unsigned char payload_id, int fru_id, int offset, int count,
   // open file for read purpose
   fd = open(fpath, O_RDONLY);
   if (fd < 0) {
-    return fd;
+    syslog(LOG_ERR, "%s: unable to open the %s file: %s", __func__, fpath, strerror(errno));
+    return -1;
   }
 
   // seek position based on given offset
   ret = lseek(fd, offset, SEEK_SET);
   if (ret < 0) {
     close(fd);
-    return ret;
+    return -1;
   }
 
   // read the file content

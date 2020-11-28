@@ -21,7 +21,6 @@ SRC_URI += " \
     file://board-utils.sh \
     file://cmmcpld_update.sh \
     file://create_vlan_intf \
-    file://eth0_mac_fixup.sh \
     file://fcbcpld_update.sh \
     file://fix_fru_eeprom.py \
     file://get_fan_speed.sh \
@@ -55,7 +54,14 @@ DEPENDS_append = " update-rc.d-native"
 
 RDEPENDS_${PN} += "python3-core"
 
+# Disable automount because 'setup_persist_log' is used instead.
+OPENBMC_UTILS_CUSTOM_EMMC_MOUNT = "1"
+
 do_install_append() {
+    # the script to mount emmc to /var/log
+    install -m 0755 ${WORKDIR}/setup_persist_log.sh ${D}${sysconfdir}/init.d/setup_persist_log.sh
+    update-rc.d -r ${D} setup_persist_log.sh start 05 S .
+
     install -m 755 setup_i2c.sh ${D}${sysconfdir}/init.d/setup_i2c.sh
     update-rc.d -r ${D} setup_i2c.sh start 80  S .
 

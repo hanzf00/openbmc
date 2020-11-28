@@ -27,6 +27,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/reboot.h>
 #include <sys/wait.h>
 #include <openbmc/kv.h>
 #include <openbmc/ipmi.h>
@@ -38,17 +39,42 @@
 #define STRINGIFY(bw) _STRINGIFY(bw)
 #define MACHINE STRINGIFY(__MACHINE__)
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(_a) (sizeof(_a) / sizeof((_a)[0]))
+#endif
+
 // PAL Variable
 size_t pal_pwm_cnt __attribute__((weak)) = 0;
 size_t pal_tach_cnt __attribute__((weak)) = 0;
+size_t pal_fan_opt_cnt __attribute__((weak)) = 0;
 char pal_pwm_list[] __attribute__((weak)) = "";
 char pal_tach_list[] __attribute__((weak)) = "";
+char pal_fan_opt_list[] __attribute__((weak)) = "";
+
+size_t server_fru_cnt __attribute__((weak)) = 0;
+size_t nic_fru_cnt __attribute__((weak)) = 0;
+size_t bmc_fru_cnt __attribute__((weak)) = 0;
+const char *pal_server_fru_list[] __attribute__((weak)) = {};
+const char *pal_nic_fru_list[] __attribute__((weak)) = {};
+const char *pal_bmc_fru_list[] __attribute__((weak)) = {};
+
 
 // PAL functions
 int __attribute__((weak))
 pal_is_bmc_por(void)
 {
   return PAL_EOK;
+}
+
+int __attribute__((weak))
+pal_bmc_reboot(int cmd) {
+  if (cmd == 0) {
+    return run_command("/sbin/reboot");
+  }
+
+  // flag for healthd logging reboot cause
+  run_command("/etc/init.d/setup-reboot.sh > /dev/null 2>&1");
+  return reboot(cmd);
 }
 
 int __attribute__((weak))
@@ -82,10 +108,107 @@ pal_get_sys_intf_caps(uint8_t slot, uint8_t *req_data, uint8_t *res_data, uint8_
   return;
 }
 
-int __attribute__((weak))
-pal_get_80port_record(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len)
+static int
+pal_lpc_snoop_read_legacy(uint8_t *buf, size_t max_len, size_t *len)
 {
-  return PAL_ENOTSUP;
+  FILE *fp = fopen("/sys/devices/platform/ast-snoop-dma.0/data_history", "r");
+  uint8_t postcode;
+  size_t i;
+
+  if (fp == NULL) {
+    syslog(LOG_WARNING, "pal_get_80port_record: Cannot open device");
+    return PAL_ENOTREADY;
+  }
+  for (i=0; i < max_len; i++) {
+    // %hhx: unsigned char*
+    if (fscanf(fp, "%hhx%*s", &postcode) == 1) {
+      buf[i] = postcode;
+    } else {
+      break;
+    }
+  }
+  if (len)
+    *len = i;
+  fclose(fp);
+  return 0;
+}
+
+static int pal_lpc_snoop_read(uint8_t *buf, size_t max_len, size_t *rlen)
+{
+  const char *dev_path = "/dev/aspeed-lpc-snoop0";
+  const char *cache_key = "postcode";
+  uint8_t cache[MAX_VALUE_LEN * 2];
+  size_t len = 0, cache_len = 0;
+  int fd;
+  uint8_t postcode;
+
+  if (kv_get(cache_key, (char *)cache, &len, 0)) {
+    len = cache_len = 0;
+  } else {
+    cache_len = len;
+  }
+
+  /* Open and read as much as we can store. Our in-mem
+   * cache is twice as the file-backed path. */
+  fd = open(dev_path, O_RDONLY | O_NONBLOCK);
+  if (fd < 0) {
+    return PAL_ENOTREADY;
+  }
+  while (len < sizeof(cache) &&
+      read(fd, &postcode, 1) == 1) {
+    cache[len++] = postcode;
+  }
+  close(fd);
+  /* Update the file-backed cache only if something
+   * changed since we read it */
+  if (len > cache_len) {
+    /* Since our in-mem cache can be twice of our file-backed
+     * cache, ensure that we are storing the latest but also
+     * limit the number to MAX_VALUE_LEN */
+    if (len > MAX_VALUE_LEN) {
+      memmove(cache, &cache[len - MAX_VALUE_LEN], MAX_VALUE_LEN);
+      len = MAX_VALUE_LEN;
+    }
+    if (kv_set(cache_key, (char *)cache, len, 0)) {
+      syslog(LOG_CRIT, "%zu postcodes dropped\n", len - cache_len);
+    }
+  }
+  len = len > max_len ? max_len : len;
+  memcpy(buf, cache, len);
+  *rlen = len;
+  return PAL_EOK;
+}
+
+int __attribute__((weak))
+pal_get_80port_record(uint8_t slot, uint8_t *buf, size_t max_len, size_t *len)
+{
+  static bool legacy = false, legacy_checked = false;
+
+  if (buf == NULL || len == NULL || max_len == 0)
+    return -1;
+
+  if (!pal_is_slot_server(slot)) {
+    syslog(LOG_WARNING, "pal_get_80port_record: slot %d is not supported", slot);
+    return PAL_ENOTSUP;
+  }
+
+  if (legacy_checked == false) {
+    if (access("/sys/devices/platform/ast-snoop-dma.0/data_history", F_OK) == 0) {
+      legacy = true;
+      legacy_checked = true;
+    } else if (access("/dev/aspeed-lpc-snoop0", F_OK) == 0) {
+      legacy_checked = true;
+    } else {
+      return PAL_ENOTSUP;
+    }
+  }
+
+  // Support for snoop-dma on 4.1 kernel.
+  if (legacy) {
+    return pal_lpc_snoop_read_legacy(buf, max_len, len);
+  }
+  return pal_lpc_snoop_read(buf, max_len, len);
+
 }
 
 int __attribute__((weak))
@@ -147,6 +270,11 @@ pal_set_power_restore_policy(uint8_t slot, uint8_t *pwr_policy, uint8_t *res_dat
   return 0;
 }
 
+uint8_t __attribute__((weak))
+pal_set_slot_power_policy(uint8_t *pwr_policy, uint8_t *res_data) {
+  return 0;
+}
+
 int __attribute__((weak))
 pal_bmc_err_disable(const char *error_item) {
   return 0;
@@ -183,46 +311,215 @@ pal_get_board_id(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_
 int __attribute__((weak))
 pal_parse_oem_unified_sel(uint8_t fru, uint8_t *sel, char *error_log)
 {
-  uint8_t general_info = (uint8_t) sel[3];
-  uint8_t error_type = general_info & 0x0f;
+  //
+  // If a platform needs to process a specific type of SEL message
+  // differently from what the common code does,
+  // this function can be overriden to do such unique handling
+  // instead of calling the common SEL parsing logic (pal_parse_oem_unified_sel_common.)
+  //
+  // This default handler will not perform any special handling, and will
+  // just call the default handler (pal_parse_oem_unified_sel_common) for every type of
+  // SEL msessages.
+  //
+
+  pal_parse_oem_unified_sel_common(fru, sel, error_log);
+
+  return 0;
+}
+
+int __attribute__((weak))
+pal_parse_oem_unified_sel_common(uint8_t fru, uint8_t *sel, char *error_log)
+{
+  uint8_t general_info = sel[3];
+  uint8_t error_type = general_info & 0xF;
   uint8_t plat;
-  uint8_t dimm_failure_event = (uint8_t) sel[12];
-  char dimm_fail_event[][64] = {"Memory training failure", "Memory correctable error", "Memory uncorrectable error", "Reserved"};
+  uint8_t event_type, estr_idx;
+  char *mem_err[] = {"Memory training failure", "Memory correctable error", "Memory uncorrectable error",
+                     "Memory correctable error (Patrol scrub)", "Memory uncorrectable error (Patrol scrub)",
+                     "Memory Parity Error event", "Reserved"};
+  char *upi_err[] = {"UPI Init error", "Reserved"};
+  char *post_err[] = {"System PXE boot fail", "CMOS/NVRAM configuration cleared", "TPM Self-Test Fail", "Reserved"};
+  char *pcie_event[] = {"PCIe DPC Event", "PCIe LER Event", "PCIe Link Retraining and Recovery",
+                        "PCIe Link CRC Error Check and Retry", "PCIe Corrupt Data Containment", "PCIe Express ECRC",
+                        "Reserved"};
+  char *mem_event[] = {"Memory PPR event", "Memory Correctable Error logging limit reached", "Memory disable/map-out for FRB",
+                       "Memory SDDC", "Memory Address range/Partial mirroring", "Memory ADDDC", "Memory SMBus hang recovery", "No DIMM in System", "Reserved"};
+  char *upi_event[] = {"Successful LLR without Phy Reinit", "Successful LLR with Phy Reinit",
+                       "COR Phy Lane failure, recovery in x8 width", "Reserved"};
+  char dimm_str[8] = {0};
+  char dimm_location_str[128] = {0};
+  char temp_log[128] = {0};
   error_log[0] = '\0';
 
   switch (error_type) {
     case UNIFIED_PCIE_ERR:
       plat = (general_info & 0x10) >> 4;
       if (plat == 0) {  //x86
-        sprintf(error_log, "GeneralInfo: x86/PCIeErr(0x%02X), Bus %02X/Dev %02X/Fun %02X, \
-                            TotalErrID1Cnt: 0x%04X, ErrID2: 0x%02X, ErrID1: 0x%02X",
-                general_info, sel[11], sel[10] >> 3, sel[10] & 0x7, ((sel[13]<<8)|sel[12]), sel[14], sel[15]);
+        sprintf(error_log, "GeneralInfo: x86/PCIeErr(0x%02X), Bus %02X/Dev %02X/Fun %02X, TotalErrID1Cnt: 0x%04X, ErrID2: 0x%02X, ErrID1: 0x%02X",
+                general_info, sel[11], sel[10]>>3, sel[10]&0x7, ((sel[13]<<8)|sel[12]), sel[14], sel[15]);
       } else {
-        sprintf(error_log, "GeneralInfo: ARM/PCIeErr(0x%02X), Aux. Info: 0x%04X, Bus %02X/Dev %02X/Fun %02X, \
-                            TotalErrID1Cnt: 0x%04X, ErrID2: 0x%02X, ErrID1: 0x%02X",
-                general_info, ((sel[9]<<8)|sel[8]),sel[11], sel[10] >> 3, sel[10] & 0x7, ((sel[13]<<8)|sel[12]), sel[14], sel[15]);
+        sprintf(error_log, "GeneralInfo: ARM/PCIeErr(0x%02X), Aux. Info: 0x%04X, Bus %02X/Dev %02X/Fun %02X, TotalErrID1Cnt: 0x%04X, ErrID2: 0x%02X, ErrID1: 0x%02X",
+                general_info, ((sel[9]<<8)|sel[8]), sel[11], sel[10]>>3,
+                sel[10]&0x7, ((sel[13]<<8)|sel[12]),sel[14], sel[15]);
       }
+      sprintf(temp_log, "PCIe Error,FRU:%u", fru);
+      pal_add_cri_sel(temp_log);
       break;
+
     case UNIFIED_MEM_ERR:
-      plat = (dimm_failure_event & 0x80) >> 7;
-      if (plat == 0) { //Intel
-        sprintf(error_log, "GeneralInfo: MemErr(0x%02X), DIMM Slot Location: Sled %02X/Socket %02X, Channel %02X, Slot %02X, \
-                          DIMM Failure Event: %s, Major Code: 0x%02X, Minor Code: 0x%02X",
-              general_info, ((sel[8]>>4) & 0x03), sel[8] & 0x0f, sel[9] & 0x0f, sel[10] & 0x0f, dimm_fail_event[sel[12]&0x03], sel[13], sel[14]);
-      } else { //AMD
-        uint16_t minor_code = sel[15] << 8 | sel[14];
-        sprintf(error_log, "GeneralInfo: MemErr(0x%02X), DIMM Slot Location: Sled %02X/Socket %02X, Channel %02X, Slot %02X, \
-                          DIMM Failure Event: %s, Major Code: 0x%02X, Minor Code: 0x%04X",
-              general_info, ((sel[8]>>4) & 0x03), sel[8] & 0x0f, sel[9] & 0x0f, sel[10] & 0x0f, dimm_fail_event[sel[12]&0x03], sel[13], minor_code);
+      plat = (sel[12] & 0x80) >> 7;
+      event_type = sel[12] & 0xF;
+      if (sel[9] == 0xFF && sel[10] == 0xFF) {
+        sprintf(dimm_str, "unknown");
+        sprintf(dimm_location_str, "DIMM Slot Location: Sled %02d/Socket %02d, Channel unknown, Slot unknown, DIMM unknown",
+                ((sel[8]>>4)&0x3), sel[8]&0xF);
+      } else {
+        pal_convert_to_dimm_str(sel[8]&0xF, sel[9]&0xF, sel[10]&0xF, dimm_str);
+        sprintf(dimm_location_str, "DIMM Slot Location: Sled %02d/Socket %02d, Channel %02d, Slot %02d, DIMM %s",
+                ((sel[8]>>4)&0x3), sel[8]&0xF, sel[9]&0xF, sel[10]&0xF, dimm_str);
+      }
+      switch (event_type) {
+        case MEMORY_TRAINING_ERR:
+          if (plat == 0) { //Intel
+            sprintf(error_log, "GeneralInfo: MEMORY_ECC_ERR(0x%02X), %s, DIMM Failure Event: %s, Major Code: 0x%02X, Minor Code: 0x%02X",
+                    general_info, dimm_location_str,
+                    mem_err[event_type], sel[13], sel[14]);
+          } else { //AMD
+            sprintf(error_log, "GeneralInfo: MEMORY_ECC_ERR(0x%02X), %s, DIMM Failure Event: %s, Major Code: 0x%02X, Minor Code: 0x%04X",
+                    general_info, dimm_location_str,
+                    mem_err[event_type], sel[13], (sel[15]<<8)|sel[14]);
+          }
+          break;
+        default:
+          estr_idx = (event_type < ARRAY_SIZE(mem_err)) ? event_type : (ARRAY_SIZE(mem_err) - 1);
+          sprintf(error_log, "GeneralInfo: MEMORY_ECC_ERR(0x%02X), %s, DIMM Failure Event: %s",
+                  general_info, dimm_location_str,
+                  mem_err[estr_idx]);
+
+          if ((event_type == MEMORY_CORRECTABLE_ERR) || (event_type == MEMORY_CORR_ERR_PTRL_SCR)) {
+            sprintf(temp_log, "DIMM%s ECC err,FRU:%u", dimm_str, fru);
+            pal_add_cri_sel(temp_log);
+          } else if ((event_type == MEMORY_UNCORRECTABLE_ERR) || (event_type == MEMORY_UNCORR_ERR_PTRL_SCR)) {
+            sprintf(temp_log, "DIMM%s UECC err,FRU:%u", dimm_str, fru);
+            pal_add_cri_sel(temp_log);
+          }
+          break;
       }
       break;
+
+    case UNIFIED_UPI_ERR:
+      event_type = sel[12] & 0xF;
+      estr_idx = (event_type < ARRAY_SIZE(upi_err)) ? event_type : (ARRAY_SIZE(upi_err) - 1);
+
+      switch (event_type) {
+        case UPI_INIT_ERR:
+          sprintf(error_log, "GeneralInfo: UPIErr(0x%02X), UPI Port Location: Sled %02d/Socket %02d, Port %02d, UPI Failure Event: %s, Major Code: 0x%02X, Minor Code: 0x%02X",
+                  general_info, ((sel[8]>>4)&0x3), sel[8]&0xF, sel[9]&0xF, upi_err[estr_idx],
+                  sel[13], sel[14]);
+          break;
+        default:
+          sprintf(error_log, "GeneralInfo: UPIErr(0x%02X), UPI Port Location: Sled %02d/Socket %02d, Port %02d, UPI Failure Event: %s",
+                  general_info, ((sel[8]>>4)&0x3), sel[8]&0xF, sel[9]&0xF, upi_err[estr_idx]);
+          break;
+      }
+      break;
+
+    case UNIFIED_IIO_ERR:
+      sprintf(error_log, "GeneralInfo: IIOErr(0x%02X), IIO Port Location: Sled %02d/Socket %02d, Stack 0x%02X, Error ID: 0x%02X",
+              general_info, sel[10], ((sel[8]>>4)&0xF), sel[8]&0xF, sel[9] );
+      break;
+
+    case UNIFIED_POST_ERR:
+      event_type = sel[8] & 0xF;
+      estr_idx = (event_type < ARRAY_SIZE(post_err)) ? event_type : (ARRAY_SIZE(post_err) - 1);
+      sprintf(error_log, "GeneralInfo: POST(0x%02X), POST Failure Event: %s", general_info, post_err[estr_idx]);
+      break;
+
+    case UNIFIED_PCIE_EVENT:
+      event_type = sel[8] & 0xF;
+      estr_idx = (event_type < ARRAY_SIZE(pcie_event)) ? event_type : (ARRAY_SIZE(pcie_event) - 1);
+
+      switch (event_type) {
+        case PCIE_DPC:
+          sprintf(error_log, "GeneralInfo: PCIeEvent(0x%02X), PCIe Failure Event: %s, Status: 0x%04X, Source ID: 0x%04X",
+                  general_info, pcie_event[estr_idx], (sel[11]<<8)|sel[10], (sel[13]<<8)|sel[12]);
+          break;
+        default:
+          sprintf(error_log, "GeneralInfo: PCIeEvent(0x%02X), PCIe Failure Event: %s",
+                  general_info, pcie_event[estr_idx]);
+          break;
+      }
+      break;
+
+    case UNIFIED_MEM_EVENT:
+      event_type = sel[8] & 0xF;
+      if (sel[10] == 0xFF && sel[11] == 0xFF) {
+        sprintf(dimm_str, "unknown");
+        sprintf(dimm_location_str, "DIMM Slot Location: Sled %02d/Socket %02d, Channel unknown, Slot unknown, DIMM unknown",
+                ((sel[9]>>4)&0x3), sel[9]&0xF);
+      } else {
+        pal_convert_to_dimm_str(sel[8]&0xF, sel[9]&0xF, sel[10]&0xF, dimm_str);
+        sprintf(dimm_location_str, "DIMM Slot Location: Sled %02d/Socket %02d, Channel %02d, Slot %02d, DIMM %s",
+                ((sel[9]>>4)&0x3), sel[9]&0xF, sel[10]&0xF, sel[11]&0xF, dimm_str);
+      }
+      switch (event_type) {
+        case MEM_PPR:
+          sprintf(error_log, "GeneralInfo: MemEvent(0x%02X), %s, DIMM Failure Event: %s",
+                  general_info, dimm_location_str,
+                  (sel[12]&0x1)?"PPR fail":"PPR success");
+          break;
+        case MEM_NO_DIMM:
+          sprintf(error_log, "GeneralInfo: MemEvent(0x%02X), DIMM Failure Event: %s",
+                  general_info, mem_event[event_type]);
+          break;
+        default:
+          estr_idx = (event_type < ARRAY_SIZE(mem_event)) ? event_type : (ARRAY_SIZE(mem_event) - 1);
+          sprintf(error_log, "GeneralInfo: MemEvent(0x%02X), %s, DIMM Failure Event: %s",
+                  general_info, dimm_location_str,
+                  mem_event[estr_idx]);
+          break;
+      }
+      break;
+
+    case UNIFIED_UPI_EVENT:
+      event_type = sel[8] & 0xF;
+      estr_idx = (event_type < ARRAY_SIZE(upi_event)) ? event_type : (ARRAY_SIZE(upi_event) - 1);
+      sprintf(error_log, "GeneralInfo: UPIEvent(0x%02X), UPI Port Location: Sled %02d/Socket %02d, Port %02d, UPI Failure Event: %s",
+              general_info, ((sel[9]>>4)&0x3), sel[9]&0xF, sel[10]&0xF, upi_event[estr_idx]);
+      break;
+
+    case UNIFIED_BOOT_GUARD:
+      sprintf(error_log, "GeneralInfo: Boot Guard ACM Failure Events(0x%02X), Error Class(0x%02X), Error Code(0x%02X)",
+              general_info, sel[8], sel[9]);
+      break;
+
     default:
       sprintf(error_log, "Undefined Error Type(0x%02X), Raw: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
-              error_type, sel[3], sel[4], sel[5], sel[6], sel[7], sel[8], sel[9], sel[10], sel[11], sel[12], sel[13], sel[14], sel[15]);
+              error_type, sel[3], sel[4], sel[5], sel[6], sel[7], sel[8], sel[9], sel[10], sel[11], sel[12], sel[13],
+              sel[14], sel[15]);
       break;
   }
 
   return 0;
+}
+
+int __attribute__((weak))
+pal_parse_mem_mapping_string(uint8_t channel, bool *support_mem_mapping, char *error_log)
+{
+  if ( support_mem_mapping ) {
+    *support_mem_mapping = false;
+  }
+  if (error_log) {
+    error_log[0] = '\0';
+  }
+  return PAL_EOK;
+}
+
+int __attribute__((weak))
+pal_convert_to_dimm_str(uint8_t cpu, uint8_t channel, uint8_t slot, char *str)
+{
+  sprintf(str, "%c%d", 'A'+channel, slot);
+  return PAL_EOK;
 }
 
 int __attribute__((weak))
@@ -281,6 +578,12 @@ pal_add_cper_log(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_
 }
 
 uint8_t __attribute__((weak))
+pal_set_psb_info(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len)
+{
+  return PAL_ENOTSUP;
+}
+
+uint8_t __attribute__((weak))
 pal_add_imc_log(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len)
 {
   return PAL_EOK;
@@ -332,6 +635,12 @@ pal_is_fru_prsnt(uint8_t fru, uint8_t *status)
 }
 
 int __attribute__((weak))
+pal_get_slot_index(unsigned char payload_id)
+{
+  return payload_id;
+}
+
+int __attribute__((weak))
 pal_get_server_power(uint8_t slot_id, uint8_t *status)
 {
   return PAL_EOK;
@@ -351,6 +660,12 @@ pal_get_device_power(uint8_t slot_id, uint8_t dev_id, uint8_t *status, uint8_t *
 
 int __attribute__((weak))
 pal_set_device_power(uint8_t slot_id, uint8_t dev_id, uint8_t cmd)
+{
+  return PAL_EOK;
+}
+
+int __attribute__((weak))
+pal_power_button_override(uint8_t slot_id)
 {
   return PAL_EOK;
 }
@@ -424,10 +739,11 @@ pal_get_fru_name(uint8_t fru, char *name)
 int __attribute__((weak))
 pal_get_dev_name(uint8_t fru, uint8_t dev, char *name)
 {
-  int ret = pal_get_fruid_name(fru, name);
+  char fruname[32];
+  int ret = pal_get_fruid_name(fru, fruname);
   if (ret < 0)
     return ret;
-  sprintf(name, "%s Device %u", name ,dev);
+  sprintf(name, "%s Device %u", fruname ,dev);
   return PAL_EOK;
 }
 
@@ -527,6 +843,12 @@ pal_get_sys_guid(uint8_t slot, char *guid)
 }
 
 int __attribute__((weak))
+pal_set_sys_guid(uint8_t fru, char *guid)
+{
+  return PAL_EOK;
+}
+
+int __attribute__((weak))
 pal_get_sysfw_ver(uint8_t slot, uint8_t *ver)
 {
   return PAL_EOK;
@@ -534,6 +856,12 @@ pal_get_sysfw_ver(uint8_t slot, uint8_t *ver)
 
 int __attribute__((weak))
 pal_set_sysfw_ver(uint8_t slot, uint8_t *ver)
+{
+  return PAL_EOK;
+}
+
+int __attribute__((weak))
+pal_is_cmd_valid(uint8_t *data)
 {
   return PAL_EOK;
 }
@@ -587,7 +915,7 @@ pal_get_x86_event_sensor_name(uint8_t fru, uint8_t snr_num,
         sprintf(name, "USB_ERR");
         break;
       case PSB_ERR:
-        sprintf(name, "PSB_ERR");
+        sprintf(name, "PSB_STS");
         break;
       case MEMORY_ECC_ERR:
         sprintf(name, "MEMORY_ECC_ERR");
@@ -673,6 +1001,12 @@ pal_get_event_sensor_name(uint8_t fru, uint8_t *sel, char *name) {
 
 int __attribute__((weak))
 pal_sel_handler(uint8_t fru, uint8_t snr_num, uint8_t *event_data)
+{
+  return PAL_EOK;
+}
+
+int __attribute__((weak))
+pal_oem_unified_sel_handler(uint8_t fru, uint8_t general_info, uint8_t *sel)
 {
   return PAL_EOK;
 }
@@ -1305,6 +1639,12 @@ pal_get_pwm_value(uint8_t fan_num, uint8_t *value)
   return PAL_EOK;
 }
 
+bool __attribute__((weak))
+pal_is_fan_prsnt(uint8_t fan)
+{
+  return true;
+}
+
 int __attribute__((weak))
 pal_fan_dead_handle(int fan_num)
 {
@@ -1367,6 +1707,12 @@ pal_log_clear(char *fru)
 
 int __attribute__((weak))
 pal_get_dev_guid(uint8_t fru, char *guid)
+{
+  return PAL_EOK;
+}
+
+int __attribute__((weak))
+pal_set_dev_guid(uint8_t fru, char *guid)
 {
   return PAL_EOK;
 }
@@ -1500,6 +1846,25 @@ int __attribute__((weak))
 pal_set_adr_trigger(uint8_t slot, bool trigger)
 {
   return PAL_ENOTSUP;
+}
+
+int __attribute__((weak))
+pal_flock_flag_retry(int fd, unsigned int flag)
+{
+  int ret = 0;
+  int retry_count = 0;
+
+  ret = flock(fd, flag);
+  while (ret && (retry_count < 3)) {
+    retry_count++;
+    msleep(100);
+    ret = flock(fd, flag);
+  }
+  if (ret) {
+    return -1;
+  }
+
+  return 0;
 }
 
 int __attribute__((weak))
@@ -1845,6 +2210,13 @@ pal_bypass_cmd(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_da
   return 0xC1;
 }
 
+int __attribute__((weak))
+pal_bypass_dev_card(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len)
+{
+  // Completion Code Invalid Command
+  return 0xC1;
+}
+
 void __attribute__((weak))
 pal_set_def_restart_cause(uint8_t slot) {
   uint8_t cause;
@@ -1962,380 +2334,10 @@ error_exit:
   return ret;
 }
 
-bool __attribute__((weak))
-pal_is_sensor_existing(uint8_t fru, uint8_t snr_num) {
-  int i;
-  bool found = false;
-  int ret;
-  int sensor_cnt;
-  uint8_t *sensor_list;
-
-  ret = pal_get_fru_sensor_list(fru, &sensor_list, &sensor_cnt);
-  if (ret < 0) {
-    printf("%s: Fail to get fru%d sensor list\n",__func__, fru);
-    return found;
-  }
-
-  for (i = 0; i < sensor_cnt; i++) {
-    if (snr_num == sensor_list[i])
-      found = true;
-  }
-
-  if (!found) {
-    return found;
-  }
-
-  return found;
-}
-
-int __attribute__((weak))
-pal_copy_all_thresh_to_file(uint8_t fru, thresh_sensor_t *sinfo) {
-  int fd;
-  uint8_t bytes_wd = 0;
-  uint8_t snr_num = 0;
-  int ret;
-  char fru_name[32];
-  int sensor_cnt;
-  uint8_t *sensor_list;
-  char fpath[64] = {0};
-  int i;
-
-  ret = pal_get_fru_name(fru, fru_name);
-  if (ret < 0) {
-    printf("%s: Fail to get fru%d name\n",__func__,fru);
-    return ret;
-  }
-
-  ret = pal_get_fru_sensor_list(fru, &sensor_list, &sensor_cnt);
-  if (ret < 0) {
-    return ret;
-  }
-
-  sprintf(fpath, INIT_THRESHOLD_BIN, fru_name);
-  fd = open(fpath, O_CREAT | O_RDWR);
-  if (fd < 0) {
-    syslog(LOG_ERR, "%s: open failed for %s, errno : %d %s\n", __func__, fpath, errno, strerror(errno));
-    return -1;
-  }
-
-  for (i = 0; i < sensor_cnt; i++) {
-    snr_num = sensor_list[i];
-    bytes_wd = write(fd, &sinfo[snr_num], sizeof(thresh_sensor_t));
-    if (bytes_wd != sizeof(thresh_sensor_t)) {
-      syslog(LOG_ERR, "%s: read returns %d bytes\n", __func__, bytes_wd);
-      close(fd);
-      return -1;
-    }
-  }
-
-  close(fd);
-  return 0;
-}
-
-int __attribute__((weak))
-pal_sensor_sdr_init(uint8_t fru, void *sinfo)
-{
-  return -1;
-}
-
-int __attribute__((weak))
-pal_get_all_thresh_from_file(uint8_t fru, thresh_sensor_t *sinfo, int mode) {
-  int fd;
-  int cnt = 0;
-  uint8_t buf[MAX_THERSH_LEN] = {0};
-  uint8_t bytes_rd = 0;
-  int ret;
-  uint8_t snr_num = 0;
-  char fru_name[8];
-  int sensor_cnt;
-  uint8_t *sensor_list;
-  char fpath[64] = {0};
-  char cmd[128] = {0};
-  int curr_state = 0;
-
-  ret = pal_get_fru_name(fru, fru_name);
-  if (ret < 0)
-    printf("%s: Fail to get fru%d name\n",__func__,fru);
-
-  switch (mode) {
-    case SENSORD_MODE_TESTING:
-      sprintf(fpath, THRESHOLD_BIN, fru_name);
-      break;
-    case SENSORD_MODE_NORMAL:
-      sprintf(fpath, INIT_THRESHOLD_BIN, fru_name);
-      break;
-    default:
-      sprintf(fpath, INIT_THRESHOLD_BIN, fru_name);
-      break;
-  }
-
-  ret = pal_get_fru_sensor_list(fru, &sensor_list, &sensor_cnt);
-  if (ret < 0) {
-    return ret;
-  }
-
-  fd = open(fpath, O_RDONLY);
-  if (fd < 0) {
-    syslog(LOG_ERR, "%s: open failed for %s, errno : %d %s\n", __func__, fpath, errno, strerror(errno));
-    return -1;
-  }
-
-  while ((bytes_rd = read(fd, buf, sizeof(thresh_sensor_t))) > 0) {
-    if (bytes_rd != sizeof(thresh_sensor_t)) {
-      syslog(LOG_ERR, "%s: read returns %d bytes\n", __func__, bytes_rd);
-      close(fd);
-      return -1;
-    }
-
-    snr_num = sensor_list[cnt];
-    curr_state = sinfo[snr_num].curr_state;
-    memcpy(&sinfo[snr_num], &buf, sizeof(thresh_sensor_t));
-    sinfo[snr_num].curr_state = curr_state;
-    memset(buf, 0, sizeof(buf));
-    cnt++;
-
-    pal_init_sensor_check(fru, snr_num, (void *)&sinfo[snr_num]);
-
-    if (cnt == sensor_cnt) {
-      syslog(LOG_ERR, "%s: cnt = %d", __func__, cnt);
-      break;
-    }
-  }
-
-  close(fd);
-
-  // Remove reinit file
-  memset(fpath, 0, sizeof(fpath));
-  sprintf(fpath, THRESHOLD_RE_FLAG, fru_name);
-  if (0 == access(fpath, F_OK)) {
-    sprintf(cmd,"rm -rf %s",fpath);
-    system(cmd);
-  }
-
-  return 0;
-}
-
-int __attribute__((weak))
-pal_get_thresh_from_file(uint8_t fru, uint8_t snr_num, thresh_sensor_t *sinfo) {
-  int fd;
-  int cnt = 0;
-  uint8_t buf[MAX_THERSH_LEN] = {0};
-  uint8_t bytes_rd = 0;
-  int ret;
-  char fru_name[8];
-  int sensor_cnt;
-  uint8_t *sensor_list;
-  char fpath[64] = {0};
-
-  ret = pal_get_fru_name(fru, fru_name);
-  if (ret < 0)
-    printf("%s: Fail to get fru%d name\n",__func__,fru);
-
-  sprintf(fpath, THRESHOLD_BIN, fru_name);
-  ret = pal_get_fru_sensor_list(fru, &sensor_list, &sensor_cnt);
-  if (ret < 0) {
-    return ret;
-  }
-
-  fd = open(fpath, O_RDONLY);
-  if (fd < 0) {
-    syslog(LOG_ERR, "%s: open failed for %s, errno : %d %s\n", __func__, fpath, errno, strerror(errno));
-    return -1;
-  }
-
-  while (cnt != sensor_cnt) {
-    lseek(fd, cnt*sizeof(thresh_sensor_t), SEEK_SET);
-    if (snr_num == sensor_list[cnt]) {
-      bytes_rd = read(fd, buf, sizeof(thresh_sensor_t));
-      if (bytes_rd != sizeof(thresh_sensor_t)) {
-        syslog(LOG_ERR, "%s: read returns %d bytes\n", __func__, bytes_rd);
-        close(fd);
-        return -1;
-      }
-      memcpy(sinfo, buf, sizeof(thresh_sensor_t));
-      break;
-    }
-    cnt++;
-  }
-
-  close(fd);
-
-  return 0;
-}
-
-int __attribute__((weak))
-pal_copy_thresh_to_file(uint8_t fru, uint8_t snr_num, thresh_sensor_t *sinfo) {
-  int fd;
-  int cnt = 0;
-  uint8_t bytes_wd = 0;
-  int ret;
-  char fru_name[8];
-  int sensor_cnt;
-  uint8_t *sensor_list;
-  char fpath[64] = {0};
-
-  ret = pal_get_fru_name(fru, fru_name);
-  if (ret < 0) {
-    printf("%s: Fail to get fru%d name\n",__func__,fru);
-    return ret;
-  }
-
-  sprintf(fpath, THRESHOLD_BIN, fru_name);
-  ret = pal_get_fru_sensor_list(fru, &sensor_list, &sensor_cnt);
-  if (ret < 0) {
-    return ret;
-  }
-
-  fd = open(fpath, O_CREAT | O_RDWR);
-  if (fd < 0) {
-    syslog(LOG_ERR, "%s: open failed for %s, errno : %d %s\n", __func__, fpath, errno, strerror(errno));
-    return -1;
-  }
-
-  while (cnt != sensor_cnt) {
-    lseek(fd, cnt*sizeof(thresh_sensor_t), SEEK_SET);
-    if (snr_num == sensor_list[cnt]) {
-      bytes_wd = write(fd, sinfo, sizeof(thresh_sensor_t));
-      if (bytes_wd != sizeof(thresh_sensor_t)) {
-        syslog(LOG_ERR, "%s: read returns %d bytes\n", __func__, bytes_wd);
-        close(fd);
-        return -1;
-      }
-      break;
-    }
-    cnt++;
-  }
-
-  close(fd);
-  return 0;
-}
-
-int __attribute__((weak))
-pal_sensor_thresh_modify(uint8_t fru,  uint8_t sensor_num, uint8_t thresh_type, float value) {
-  int ret = -1;
-  thresh_sensor_t snr;
-  char fru_name[8];
-  char fpath[64] = {0};
-  char initpath[64] = {0};
-  char cmd[128] = {0};
-
-  ret = pal_get_fru_name(fru, fru_name);
-  if (ret < 0) {
-    printf("%s: Fail to get fru%d name\n",__func__,fru);
-    return ret;
-  }
-
-  memset(fpath, 0, sizeof(fpath));
-  sprintf(fpath, THRESHOLD_BIN, fru_name);
-  memset(initpath, 0, sizeof(initpath));
-  sprintf(initpath, INIT_THRESHOLD_BIN, fru_name);
-  if (0 != access(fpath, F_OK)) {
-    sprintf(cmd,"cp -rf %s %s", initpath, fpath);
-    system(cmd);
-  }
-
-  ret = pal_get_thresh_from_file(fru, sensor_num, &snr);
-  if (ret < 0) {
-    syslog(LOG_ERR, "%s: Fail to get %s sensor threshold file\n",__func__,fru_name);
-    return ret;
-  }
-
-  switch (thresh_type) {
-    case UCR_THRESH:
-      if (((snr.flag & GETMASK(UNR_THRESH)) && (value > snr.unr_thresh)) ||
-          ((snr.flag & GETMASK(UNC_THRESH)) && (value < snr.unc_thresh)) ||
-          ((snr.flag & GETMASK(LNC_THRESH)) && (value < snr.lnc_thresh)) ||
-          ((snr.flag & GETMASK(LCR_THRESH)) && (value < snr.lcr_thresh)) ||
-          ((snr.flag & GETMASK(LNR_THRESH)) && (value < snr.lnr_thresh))) {
-        return -1;
-      }
-      snr.ucr_thresh = value;
-      snr.flag |= SETMASK(UCR_THRESH);
-      break;
-    case UNC_THRESH:
-      if (((snr.flag & GETMASK(UNR_THRESH)) && (value > snr.unr_thresh)) ||
-          ((snr.flag & GETMASK(UCR_THRESH)) && (value > snr.ucr_thresh)) ||
-          ((snr.flag & GETMASK(LNC_THRESH)) && (value < snr.lnc_thresh)) ||
-          ((snr.flag & GETMASK(LCR_THRESH)) && (value < snr.lcr_thresh)) ||
-          ((snr.flag & GETMASK(LNR_THRESH)) && (value < snr.lnr_thresh))) {
-        return -1;
-      }
-      snr.unc_thresh = value;
-      snr.flag |= SETMASK(UNC_THRESH);
-      break;
-    case UNR_THRESH:
-      if (((snr.flag & GETMASK(UCR_THRESH)) && (value < snr.ucr_thresh)) ||
-          ((snr.flag & GETMASK(UNC_THRESH)) && (value < snr.unc_thresh)) ||
-          ((snr.flag & GETMASK(LNC_THRESH)) && (value < snr.lnc_thresh)) ||
-          ((snr.flag & GETMASK(LCR_THRESH)) && (value < snr.lcr_thresh)) ||
-          ((snr.flag & GETMASK(LNR_THRESH)) && (value < snr.lnr_thresh))) {
-        return -1;
-      }
-      snr.unr_thresh = value;
-      snr.flag |= SETMASK(UNR_THRESH);
-      break;
-    case LCR_THRESH:
-      if (((snr.flag & GETMASK(LNR_THRESH)) && (value < snr.lnr_thresh)) ||
-          ((snr.flag & GETMASK(LNC_THRESH)) && (value > snr.lnc_thresh)) ||
-          ((snr.flag & GETMASK(UNC_THRESH)) && (value > snr.unc_thresh)) ||
-          ((snr.flag & GETMASK(UCR_THRESH)) && (value > snr.ucr_thresh)) ||
-          ((snr.flag & GETMASK(UNR_THRESH)) && (value > snr.unr_thresh))) {
-        return -1;
-      }
-      snr.lcr_thresh = value;
-      snr.flag |= SETMASK(LCR_THRESH);
-      break;
-    case LNC_THRESH:
-      if (((snr.flag & GETMASK(LNR_THRESH)) && (value < snr.lnr_thresh)) ||
-          ((snr.flag & GETMASK(LCR_THRESH)) && (value < snr.lcr_thresh)) ||
-          ((snr.flag & GETMASK(UNC_THRESH)) && (value > snr.unc_thresh)) ||
-          ((snr.flag & GETMASK(UCR_THRESH)) && (value > snr.ucr_thresh)) ||
-          ((snr.flag & GETMASK(UNR_THRESH)) && (value > snr.unr_thresh))) {
-        return -1;
-      }
-      snr.lnc_thresh = value;
-      snr.flag |= SETMASK(LNC_THRESH);
-      break;
-    case LNR_THRESH:
-      if (((snr.flag & GETMASK(LCR_THRESH)) && (value > snr.lcr_thresh)) ||
-          ((snr.flag & GETMASK(LNC_THRESH)) && (value > snr.lnc_thresh)) ||
-          ((snr.flag & GETMASK(UNC_THRESH)) && (value > snr.unc_thresh)) ||
-          ((snr.flag & GETMASK(UCR_THRESH)) && (value > snr.ucr_thresh)) ||
-          ((snr.flag & GETMASK(UNR_THRESH)) && (value > snr.unr_thresh))) {
-        return -1;
-      }
-      snr.lnr_thresh = value;
-      snr.flag |= SETMASK(LNR_THRESH);
-      break;
-    default:
-      syslog(LOG_WARNING, "%s Incorrect sensor threshold type",__func__);
-      return -1;
-  }
-
-  ret = pal_copy_thresh_to_file(fru, sensor_num, &snr);
-  if (ret < 0) {
-    printf("fail to set threshold file for %s\n", fru_name);
-    return ret;
-  }
-
-  // Create reinit file
-  memset(fpath, 0, sizeof(fpath));
-  sprintf(fpath, THRESHOLD_RE_FLAG, fru_name);
-  sprintf(cmd,"touch %s",fpath);
-  system(cmd);
-
-  return 0;
-}
-
 void __attribute__((weak))
 pal_get_me_name(uint8_t fru, char *target_name) {
   strcpy(target_name, "ME");
   return;
-}
-
-int __attribute__((weak))
-pal_ignore_thresh(uint8_t fru, uint8_t snr_num, uint8_t thresh){
-  return 0;
 }
 
 int __attribute__((weak))
@@ -2364,11 +2366,6 @@ pal_specific_plat_fan_check(bool status)
   return;
 }
 
-int __attribute__((weak))
-pal_get_sensor_util_timeout(uint8_t fru) {
-  return 4;
-}
-
 bool __attribute__((weak))
 pal_get_pair_fru(uint8_t slot_id, uint8_t *pair_fru)
 {
@@ -2387,6 +2384,12 @@ pal_get_tach_list(void)
   return pal_tach_list;
 }
 
+char * __attribute__((weak))
+pal_get_fan_opt_list(void)
+{
+  return pal_fan_opt_list;
+}
+
 int __attribute__((weak))
 pal_get_pwm_cnt(void)
 {
@@ -2397,6 +2400,18 @@ int __attribute__((weak))
 pal_get_tach_cnt(void)
 {
   return pal_tach_cnt;
+}
+
+int __attribute__((weak))
+pal_get_fan_opt_cnt(void)
+{
+  return pal_fan_opt_cnt;
+}
+
+int __attribute__((weak))
+pal_set_fan_ctrl(char *ctrl_opt)
+{
+  return -1;
 }
 
 int __attribute__((weak))
@@ -2439,4 +2454,127 @@ pal_set_sdr_update_flag(uint8_t slot, uint8_t update) {
 int __attribute__((weak))
 pal_get_sdr_update_flag(uint8_t slot) {
   return 0;
+}
+
+int __attribute__((weak))
+pal_fw_update_prepare(uint8_t fru, const char *comp) {
+  return 0;
+}
+
+int __attribute__((weak))
+pal_fw_update_finished(uint8_t fru, const char *comp, int status) {
+  return status;
+}
+
+bool __attribute__((weak))
+pal_is_modify_sel_time(uint8_t *sel, int size) {
+
+  return false;
+}
+
+int __attribute__((weak))
+pal_update_sensor_reading_sdr (uint8_t fru) {
+  return 0;
+}
+
+int __attribute__((weak))
+pal_get_80port_page_record(uint8_t slot, uint8_t page_num, uint8_t *buf, size_t max_len, size_t *len) {
+  return PAL_ENOTSUP;
+}
+
+int __attribute__((weak))
+pal_set_usb_path (uint8_t slot, uint8_t endpoint) {
+  return PAL_ENOTSUP;
+}
+
+int __attribute__((weak))
+pal_display_4byte_post_code(uint8_t slot, uint32_t postcode_dw)
+{
+  return 0;
+}
+
+void __attribute__((weak))
+pal_get_eth_intf_name(char* intf_name) {
+  snprintf(intf_name, 8, "eth0");
+}
+
+int __attribute__((weak))
+pal_get_host_system_mode(uint8_t *mode) {
+  return PAL_ENOTSUP;
+}
+
+uint8_t __attribute__((weak))
+pal_ipmb_get_sensor_val(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len) {
+  *res_len = 0;
+  return 0;
+}
+
+int __attribute__((weak))
+pal_sensor_monitor_initial(void) {
+  return 0;
+}
+
+int __attribute__((weak))
+pal_set_host_system_mode(uint8_t mode) {
+  return PAL_ENOTSUP;
+}
+
+int __attribute__((weak))
+pal_is_pfr_active(void) {
+  return PFR_NONE;
+}
+
+int __attribute__((weak))
+pal_get_pfr_address(uint8_t fru, uint8_t *bus, uint8_t *addr, bool *bridged)
+{
+  return -1;
+}
+
+int __attribute__((weak))
+pal_get_pfr_update_address(uint8_t fru, uint8_t *bus, uint8_t *addr, bool *bridged)
+{
+  return -1;
+}
+
+int __attribute__((weak))
+pal_get_dev_card_sensor(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len) {
+  return PAL_ENOTSUP;
+}
+
+int __attribute__((weak))
+pal_set_bios_cap_fw_ver(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len)
+{
+  return PAL_ENOTSUP;
+}
+
+int __attribute__((weak))
+pal_is_sensor_valid(uint8_t fru, uint8_t snr_num) {
+  return 0;
+}
+
+int __attribute__((weak))
+pal_get_fru_type_list(fru_type_t fru_type, const char ***fru_list, uint8_t* num_fru)
+{
+  int ret = 0;
+
+  switch (fru_type) {
+    case FRU_TYPE_SERVER:
+      *num_fru = server_fru_cnt;
+      *fru_list = pal_server_fru_list;
+      break;
+    case FRU_TYPE_NIC:
+      *num_fru = nic_fru_cnt;
+      *fru_list = pal_nic_fru_list;
+      break;
+    case FRU_TYPE_BMC:
+      *num_fru = bmc_fru_cnt;
+      *fru_list = pal_bmc_fru_list;
+      break;
+    default:
+      *num_fru = 0;
+      *fru_list = NULL;
+      ret = -1;
+      break;
+  }
+  return ret;
 }

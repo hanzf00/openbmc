@@ -18,13 +18,11 @@
 
 #include <signal.h>
 #include <assert.h>
-#include <errno.h>
-#include <stdio.h>
-#include <string.h>
 #include <libgen.h>
 #include <openbmc/kv.h>
 #include <openbmc/log.h>
 #include <openbmc/obmc-i2c.h>
+#include <openbmc/obmc-pmbus.h>
 #include <openbmc/pal.h>
 #include <openbmc/fruid.h>
 #include <facebook/wedge_eeprom.h>
@@ -32,14 +30,26 @@
 
 // #define DEBUG
 
+static delta_hdr_t delta_hdr;
+static int g_fd = -1;
+
+static void
+exithandler(int signum) {
+  printf("\nPEM update abort!\n");
+  syslog(LOG_WARNING, "PEM update abort!");
+  close(g_fd);
+  run_command("rm /var/run/pem-util.pid");
+  exit(0);
+}
+
 i2c_info_t pem[] = {
-  {-1, 22, {0x58, 0x18, 0x50}, {PEM_LTC4282_REG_CNT, PEM_MAX6615_REG_CNT, 0},
+  {-1, 24, {0x58, 0x18, 0x50}, {PEM_LTC4282_REG_CNT, PEM_MAX6615_REG_CNT, 0},
    {PEM_BLACKBOX(1, ltc4282), PEM_BLACKBOX(1, max6615), PEM1_EEPROM}},
-  {-1, 23, {0x58, 0x18, 0x50}, {PEM_LTC4282_REG_CNT, PEM_MAX6615_REG_CNT, 0},
+  {-1, 25, {0x58, 0x18, 0x50}, {PEM_LTC4282_REG_CNT, PEM_MAX6615_REG_CNT, 0},
    {PEM_BLACKBOX(2, ltc4282), PEM_BLACKBOX(2, max6615), PEM2_EEPROM}},
 };
 
-smbus_info_t smbus[] = {
+smbus_info_t smbus_ltc4282[] = {
   {"CONTROL", 0x00, 2},
   {"ALERT", 0x02, 2},
   {"FAULT_LOG", 0x04, 1},
@@ -93,6 +103,11 @@ smbus_info_t smbus[] = {
   {"POWER_MIN", 0x48, 2},
   {"POWER_MAX", 0x4A, 2},
   {"EE_SCRATCH", 0x4C, 4},
+
+  {"APP_FW_MAJOR", 0x50, 1},
+  {"APP_FW_MINOR", 0x51, 1},
+  {"BL_FW_MAJOR", 0x52, 1},
+  {"BL_FW_MINOR", 0x53, 1},
 };
 
 pem_eeprom_reg_t pem_default_config = {
@@ -111,31 +126,28 @@ pem_eeprom_reg_t pem_default_config = {
   .power_alarm_min = 0,
   .power_alarm_max = 0xff,
   .clock_decimator.reg_val.value = 0x08,
-  .ilim_adjust.reg_val.value = 0x35,
+  .ilim_adjust.reg_val.value = 0x55,
 };
 
-static int
-i2c_open(uint8_t bus, uint8_t addr) {
-  int fd = -1;
-  int rc = -1;
-  char fn[32];
+static void
+sensord_operation(uint8_t num, uint8_t action) {
 
-  snprintf(fn, sizeof(fn), "/dev/i2c-%d", bus);
-  fd = open(fn, O_RDWR);
-
-  if (fd == -1) {
-    OBMC_ERROR(errno, "Failed to open i2c device %s", fn);
-    return -1;
+  if (action == STOP) {
+    syslog(LOG_WARNING, "Stop monitor PEM%d sensor to update", num + 1);
+    run_command("sv stop sensord > /dev/null");
+    switch (num) {
+      case 0:
+        run_command("/usr/local/bin/sensord scm smb pem2 > /dev/null 2>&1 &");
+        break;
+      case 1:
+        run_command("/usr/local/bin/sensord scm smb pem1> /dev/null 2>&1 &");
+        break;
+    }
+  } else if (action == START) {
+    run_command("killall sensord");
+    run_command("sv start sensord > /dev/nul");
+    syslog(LOG_WARNING, "Start monitor PEM%d sensor", num + 1);
   }
-
-  rc = ioctl(fd, I2C_SLAVE_FORCE, addr);
-  if (rc < 0) {
-    OBMC_ERROR(errno, "Failed to open slave @ address 0x%x", addr);
-    close(fd);
-    return -1;
-  }
-
-  return fd;
 }
 
 /*
@@ -152,24 +164,43 @@ static int pem_reg_read(int fd, uint8_t reg, void *value) {
     case ENERGY:
     case TIME_COUNTER:
     case EE_SCRATCH:
-        return -1;
+      return -1;
+
+    case VGPIO:
+      byte = i2c_smbus_read_byte_data(fd, smbus_ltc4282[ILIM_ADJUST].reg);
+      /* Select GPIO3 */
+      byte &= (~0x03);
+      byte = i2c_smbus_write_byte_data(fd, smbus_ltc4282[ILIM_ADJUST].reg, byte);
+      msleep(100);
+      word = i2c_smbus_read_word_data(fd, smbus_ltc4282[reg].reg);
+      *(uint16_t *)value = ((uint16_t)(word << 8) | word >> 8);
+      break;
+    case VIN:
+      byte = i2c_smbus_read_byte_data(fd, smbus_ltc4282[ILIM_ADJUST].reg);
+      /* Select Vin, Enable 12-bits mode */
+      byte |= 0x05;
+      byte &= (~0x03);
+      byte = i2c_smbus_write_byte_data(fd, smbus_ltc4282[ILIM_ADJUST].reg, byte);
+      msleep(100);
+      word = i2c_smbus_read_word_data(fd, smbus_ltc4282[reg].reg);
+      *(uint16_t *)value = ((uint16_t)(word << 8) | word >> 8);
+      break;
+    case VOUT:
+      byte = i2c_smbus_read_byte_data(fd, smbus_ltc4282[EE_ILIM_ADJUST].reg);
+      /* Select Vout, Enable 12-bits mode */
+      byte |= 0x01;
+      byte &= (~0x05);
+      byte = i2c_smbus_write_byte_data(fd, smbus_ltc4282[ILIM_ADJUST].reg, byte);
+      msleep(100);
+      word = i2c_smbus_read_word_data(fd, smbus_ltc4282[reg].reg);
+      *(uint16_t *)value = ((uint16_t)(word << 8) | word >> 8);
+      break;
+
     case CONTROL:
     case ALERT:
     case STATUS:
-    case VGPIO:
     case VGPIO_MIN:
     case VGPIO_MAX:
-    case VIN:
-      byte = i2c_smbus_read_byte_data(fd, smbus[ILIM_ADJUST].reg);
-      byte |= 0x05;
-      byte = i2c_smbus_write_byte_data(fd, smbus[ILIM_ADJUST].reg, byte);
-      msleep(1100);
-    case VOUT:
-      byte = i2c_smbus_read_byte_data(fd, smbus[ILIM_ADJUST].reg);
-      byte |= 0x01;
-      byte &= 0x04;
-      byte = i2c_smbus_write_byte_data(fd, smbus[ILIM_ADJUST].reg, byte);
-      msleep(1100);
     case VSOURCE_MIN:
     case VSOURCE_MAX:
     case VSENSE:
@@ -180,7 +211,7 @@ static int pem_reg_read(int fd, uint8_t reg, void *value) {
     case POWER_MAX:
     case EE_CONTROL:
     case EE_ALERT:
-      word = i2c_smbus_read_word_data(fd, smbus[reg].reg);
+      word = i2c_smbus_read_word_data(fd, smbus_ltc4282[reg].reg);
       *(uint16_t *)value = ((uint16_t)(word << 8) | word >> 8);
       break;
 
@@ -214,7 +245,11 @@ static int pem_reg_read(int fd, uint8_t reg, void *value) {
     case EE_POWER_ALARM_MAX:
     case EE_CLOCK_DECIMATOR:
     case EE_ILIM_ADJUST:
-      byte = i2c_smbus_read_byte_data(fd, smbus[reg].reg);
+    case APP_FW_MAJOR:
+    case APP_FW_MINOR:
+    case BL_FW_MAJOR:
+    case BL_FW_MINOR:
+      byte = i2c_smbus_read_byte_data(fd, smbus_ltc4282[reg].reg);
       *(uint8_t *)value = byte;
       break;
     default:
@@ -281,7 +316,7 @@ static int pem_reg_write(int fd, uint8_t reg, int value) {
     case POWER_MIN:
     case POWER_MAX:
       word = value & 0xFFFF;
-      word = i2c_smbus_write_word_data(fd, smbus[reg].reg, word);
+      word = i2c_smbus_write_word_data(fd, smbus_ltc4282[reg].reg, word);
       break;
     case EE_CONTROL:
     case EE_ALERT:
@@ -290,11 +325,11 @@ static int pem_reg_write(int fd, uint8_t reg, int value) {
       if(wait_eeprom_done(fd) == -1)
         return -1;
       byte = (word & 0xFF00) >> 8;
-      byte = i2c_smbus_write_byte_data(fd, smbus[reg].reg, byte);
+      byte = i2c_smbus_write_byte_data(fd, smbus_ltc4282[reg].reg, byte);
       if(wait_eeprom_done(fd) == -1)
         return -1;
       byte = word & 0xFF;
-      byte = i2c_smbus_write_byte_data(fd, smbus[reg].reg + 1, byte);
+      byte = i2c_smbus_write_byte_data(fd, smbus_ltc4282[reg].reg + 1, byte);
       break;
 
     case FAULT_LOG:
@@ -314,7 +349,7 @@ static int pem_reg_write(int fd, uint8_t reg, int value) {
     case ALERT_CONTROL:
     case ADC_CONTROL:
       byte = value & 0xFF;
-      byte = i2c_smbus_write_byte_data(fd, smbus[reg].reg, byte);
+      byte = i2c_smbus_write_byte_data(fd, smbus_ltc4282[reg].reg, byte);
       break;
     case EE_FAULT:
     case EE_ADC_ALERT_LOG:
@@ -333,13 +368,71 @@ static int pem_reg_write(int fd, uint8_t reg, int value) {
       if(wait_eeprom_done(fd) == -1)
         return -1;
       byte = value & 0xFF;
-      byte = i2c_smbus_write_byte_data(fd, smbus[reg].reg, byte);
+      byte = i2c_smbus_write_byte_data(fd, smbus_ltc4282[reg].reg, byte);
       break;
     default:
       break;
   }
 
   return 0;
+}
+
+/* 
+ * ltc4282 Vin/Vout 16 bits adc convert to Volts 
+ * refer to ltc4282 datasheet page 23
+ */
+static inline float ltc4282_vsourve_calculate(int reg_val) {
+  return (reg_val * 16.64 / 65535);
+}
+
+/* 
+ * ltc4282 Current 16 bits adc convert to Amps 
+ * refer to ltc4282 datasheet page 23
+ * Rsense = 0.0001875 ohm
+ */
+static inline float ltc4282_vsense_calculate(int reg_val) {
+  return (reg_val * 0.04 / 65535 / 0.0001875);
+}
+
+/* 
+ * ltc4282 Power 16 bits adc convert to Watts 
+ * refer to ltc4282 datasheet page 23
+ * Rsense = 0.0001875 ohm
+ */
+static inline float ltc4282_power_calculate(int reg_val) {
+  return (reg_val * 16.64 * 0.04 / 65535 / 0.0001875);
+}
+
+/* 
+ * ltc4282 Hot Swap Temp 16 bits adc convert to degree C 
+ * linear correction
+ */
+static inline float ltc4282_temp_calculate(int reg_val) {
+  float temp = ((reg_val * 14412.0 - 15000000) / 10000) / 1000;
+  return temp > 0 ? temp : 0;
+}
+
+/*
+ * From datesheet reg addr 0x1E & 0x1F, 
+ * the temps LSBs(decimal part) are three bits.
+ * So the unit is 1/8C, need to multiply by 125 = 1/8*1000.
+ */
+static inline float max6615_temp_calculate(int reg_val) {
+  return reg_val * 0.125;
+}
+
+/*
+ * formula come from recalibration
+ */
+static inline float max6615_fan_calculate(int reg_val) {
+  return ((reg_val == 0xff || reg_val == 0) ? 0 : 57600.0 / reg_val);
+}
+
+/*
+ * refer to MAX6615 datasheet page 13th
+ */
+static inline float max6615_pwm_calculate(int reg_val) {
+  return reg_val / 240.0 * 100;
 }
 
 int is_pem_prsnt(uint8_t num, uint8_t *status) {
@@ -390,9 +483,9 @@ int file_write(const char *file, char *value, size_t len, unsigned int flags) {
   }
   memset(curr_value, 0, len);
 
-  fp = fopen(file, "r+");
+  fp = fopen(file, "rb+");
   if (!fp && (errno == ENOENT)) {
-    fp = fopen(file, "w");
+    fp = fopen(file, "wb");
     present = false;
   }
   if (!fp) {
@@ -408,12 +501,15 @@ int file_write(const char *file, char *value, size_t len, unsigned int flags) {
   // Check if we are writing the same value. If so, exit early
   // to save on number of times flash is updated.
   if (present && (flags && KV_FPERSIST)) {
-    rc = (int)fread(curr_value, 1, MAX_VALUE_LEN, fp);
+    rc = (int)fread(curr_value, 1, PEM_ARCHIVE_BUFF, fp);
     if (len == rc && !memcmp(value, curr_value, len)) {
       ret = 0;
       goto unlock_bail;
     }
-    fseek(fp, 0, SEEK_SET);
+    rc = fseek(fp, 0, SEEK_SET);
+    if (rc < 0) {
+      goto close_bail;
+    }
   }
 
   if (ftruncate(fileno(fp), 0) < 0) {  //truncate cache file after getting flock
@@ -424,7 +520,10 @@ int file_write(const char *file, char *value, size_t len, unsigned int flags) {
   if (rc < 0) {
     goto unlock_bail;
   }
-  fflush(fp);
+  rc= fflush(fp);
+  if (rc != 0) {
+    goto unlock_bail;
+  }
 
   if (rc != len) {
     goto unlock_bail;
@@ -455,7 +554,7 @@ int file_read(const char *file, char *value, size_t *len) {
   FILE *fp;
   int rc, ret=-1;
 
-  fp = fopen(file, "r");
+  fp = fopen(file, "rb");
   if (!fp) {
     return -1;
   }
@@ -465,7 +564,7 @@ int file_read(const char *file, char *value, size_t *len) {
     goto close_bail;
   }
 
-  rc = (int) fread(value, 1, MAX_VALUE_LEN, fp);
+  rc = (int) fread(value, 1, PEM_ARCHIVE_BUFF, fp);
   if (rc < 0 || ferror(fp)) {
     goto unlock_bail;
   }
@@ -487,7 +586,7 @@ close_bail:
  */
 int archive_pem_chips(uint8_t num) {
   int ret = 0;
-  char *value;
+  char *chip_regs;
   char path[MAX_KEY_PATH_LEN];
 
   for(int chip = LTC4282; chip <= MAX6615; chip++) {
@@ -495,25 +594,146 @@ int archive_pem_chips(uint8_t num) {
     strcpy(path, pem[num].file_path[chip]);
     mkdir_recurse(dirname(path), 0777);
 
-    pem[num].fd = i2c_open(pem[num].bus, pem[num].chip_addr[LTC4282]);
+    pem[num].fd = i2c_cdev_slave_open(pem[num].bus, pem[num].chip_addr[chip],
+                                      I2C_SLAVE_FORCE_CLAIM);
     if (pem[num].fd < 0) {
       ERR_PRINT("Fail to open i2c");
       ret |= (1 << chip);
       continue;
     }
 
-    value = malloc(pem[num].chip_reg_cnt[chip]);
-    if(value == NULL) {
+    chip_regs = malloc(pem[num].chip_reg_cnt[chip]);
+    if(chip_regs == NULL) {
       close(pem[num].fd);
       ret |= (1 << chip);
       continue;
     }
 
     for(int reg = 0; reg < pem[num].chip_reg_cnt[chip]; reg++) {
-      *(value + reg) = i2c_smbus_read_byte_data(pem[num].fd, reg);
+      *(chip_regs + reg) = i2c_smbus_read_byte_data(pem[num].fd, reg);
     }
 
-    file_write(pem[num].file_path[chip], value, pem[num].chip_reg_cnt[chip], KV_FPERSIST);
+    file_write(pem[num].file_path[chip], chip_regs, pem[num].chip_reg_cnt[chip], KV_FPERSIST);
+    free(chip_regs);
+  }
+
+  return ret;
+}
+
+static void print_pem_status_regs(pem_status_regs_t *status_regs);
+static int print_ltc4282_crit_sensors(char *chip_regs) {
+  int ret = 0;
+  int reg_val;
+  int threshold_sensors[] = { VIN, VOUT, VSENSE, POWER, VGPIO };
+  pem_status_regs_t discrete_sensors;
+  pem_status_regs_t discrete_sensors_ee;
+
+  if(chip_regs == NULL) {
+    return -1;
+  }
+
+  for (int sensor = 0; sensor < sizeof(threshold_sensors) / sizeof(int); sensor++) {
+    int reg = threshold_sensors[sensor];
+    reg_val = 0;
+    reg_val = (*(chip_regs + smbus_ltc4282[reg].reg)) << 8 | 
+              (*(chip_regs + smbus_ltc4282[reg].reg + 1));
+    switch(reg) {
+      case VIN:
+        printf("%-32s: %.2f Volts\n", "IN_VOLT", ltc4282_vsourve_calculate(reg_val));
+        break;
+      case VOUT:
+        printf("%-32s: %.2f Volts\n", "OUT_VOLT", ltc4282_vsourve_calculate(reg_val));
+        break;
+      case VSENSE:
+        printf("%-32s: %.2f Amps\n", "CURR", ltc4282_vsense_calculate(reg_val));
+        break;
+      case POWER:
+        printf("%-32s: %.2f Watts\n", "POWER", ltc4282_power_calculate(reg_val));
+        break;
+      case VGPIO:
+        printf("%-32s: %.2f C\n", "HOT_SWAP_TEMP", ltc4282_temp_calculate(reg_val));
+        break;
+    }
+  }
+
+  discrete_sensors.fault.reg_val.value = *(chip_regs + smbus_ltc4282[FAULT_LOG].reg);
+  discrete_sensors.adc_alert_log.reg_val.value = *(chip_regs + smbus_ltc4282[ADC_ALERT_LOG].reg);
+  discrete_sensors.status.reg_val.value = (*(chip_regs + smbus_ltc4282[STATUS].reg)) << 8 | 
+                                          (*(chip_regs + smbus_ltc4282[STATUS].reg + 1));
+  printf("\nDecode ltc4282 STATUS/FAULT/ADC_ALERT_LOG:");
+  print_pem_status_regs(&discrete_sensors);
+
+  discrete_sensors_ee.fault.reg_val.value = *(chip_regs + smbus_ltc4282[FAULT_LOG].reg);
+  discrete_sensors_ee.adc_alert_log.reg_val.value = *(chip_regs + smbus_ltc4282[ADC_ALERT_LOG].reg);
+  discrete_sensors_ee.status.reg_val.value = (*(chip_regs + smbus_ltc4282[STATUS].reg)) << 8 | 
+                                             (*(chip_regs + smbus_ltc4282[STATUS].reg + 1));
+  printf("\nDecode ltc4282 EE_STATUS/EE_FAULT_LOG/EE_ADC_ALERT_LOG:");
+  print_pem_status_regs(&discrete_sensors_ee);
+
+  return ret;
+}
+
+static int print_max6615_crit_sensors(char *chip_regs) {
+  int ret = 0;
+  int temp;
+  int fan_cnt;
+  int pwm_target;
+  int pwm_output;
+
+  if(chip_regs == NULL)
+    return -1;
+
+  temp = *(chip_regs + MAX6615_REG_TEMP(0)) << 3 | (*(chip_regs + MAX6615_REG_TEMP_EXT(0)) >> 5);
+  fan_cnt = *(chip_regs + MAX6615_REG_FAN_CNT(0));
+  pwm_target = *(chip_regs + MAX6615_REG_TARGT_PWM(0));
+  pwm_output = *(chip_regs + MAX6615_REG_INSTANTANEOUS_PWM(0));
+  printf("%-32s: %.2f C\n", "AIR_INLET_TEMP", max6615_temp_calculate(temp));
+  printf("%-32s: %.2f RPM\n", "FAN1_SPEED", max6615_fan_calculate(fan_cnt));
+  printf("%-32s: %.2f %%\n", "FAN1_TARGET_PWM", max6615_pwm_calculate(pwm_target));
+  printf("%-32s: %.2f %%\n", "FAN1_PWM_OUTPUT", max6615_pwm_calculate(pwm_output));
+
+  temp = *(chip_regs + MAX6615_REG_TEMP(1)) << 3 | (*(chip_regs + MAX6615_REG_TEMP_EXT(1)) >> 5);
+  fan_cnt = *(chip_regs + MAX6615_REG_FAN_CNT(1));
+  pwm_target = *(chip_regs + MAX6615_REG_TARGT_PWM(1));
+  pwm_output = *(chip_regs + MAX6615_REG_INSTANTANEOUS_PWM(1));
+  printf("%-32s: %.2f C\n", "AIR_OUTLET_TEMP", max6615_temp_calculate(temp));
+  printf("%-32s: %.2f RPM\n", "FAN2_SPEED", max6615_fan_calculate(fan_cnt));
+  printf("%-32s: %.2f %%\n", "FAN2_TARGET_PWM", max6615_pwm_calculate(pwm_target));
+  printf("%-32s: %.2f %%\n", "FAN2_PWM_OUTPUT", max6615_pwm_calculate(pwm_output));
+
+  return ret;
+}
+
+static int decode_pem_backup_log(uint8_t num) {
+  int ret = 0;
+  char *chip_regs;
+
+  for(int chip = LTC4282; chip <= MAX6615; chip++) {
+    chip_regs = malloc(pem[num].chip_reg_cnt[chip]);
+    if(chip_regs == NULL) {
+      ret |= (1 << chip);
+      continue;
+    }
+
+    size_t len = 0;
+    if(file_read(pem[num].file_path[chip], chip_regs, &len)) {
+      printf("Failed to read %s\n", pem[num].file_path[chip]);
+      free(chip_regs);
+      ret |= (1 << chip);
+      continue;
+    }
+
+    printf("\nDecode %s: \n", pem[num].file_path[chip]);
+    switch(chip) {
+      case LTC4282:
+        print_ltc4282_crit_sensors(chip_regs);
+        break;
+      case MAX6615:
+        print_max6615_crit_sensors(chip_regs);
+        break;
+    }
+
+    free(chip_regs);
   }
 
   return ret;
@@ -538,6 +758,7 @@ static void print_pem_sensors(uint8_t num) {
       printf("\n%-32s: %s", sensor_name, "NA");
     }
   }
+  printf("\n");
 }
 
 static void print_pem_control_reg(pem_control_t *control) {
@@ -582,26 +803,26 @@ static void print_pem_alert_reg(pem_alert_t *alert) {
 }
 
 static void print_pem_fault_reg(pem_fault_t *fault) {
-  printf("\n%-32s: %d", "EEPROM Done", fault->reg_val.values.eeprom_done);
-  printf("\n%-32s: %d", "FET Bad Fault", fault->reg_val.values.fet_bad_fault);
-  printf("\n%-32s: %d", "FET Short Fault", fault->reg_val.values.fet_short_fault);
-  printf("\n%-32s: %d", "On Fault", fault->reg_val.values.on_fault);
-  printf("\n%-32s: %d", "Power Bad Fault", fault->reg_val.values.power_bad_fault);
-  printf("\n%-32s: %d", "OC Fault", fault->reg_val.values.oc_fault);
-  printf("\n%-32s: %d", "UV Fault", fault->reg_val.values.uv_fault);
-  printf("\n%-32s: %d", "OV Fault", fault->reg_val.values.ov_fault);
+  printf("\n%-32s: %d", "EEPROM_Done", fault->reg_val.values.eeprom_done);
+  printf("\n%-32s: %d", "FET_Bad_Fault", fault->reg_val.values.fet_bad_fault);
+  printf("\n%-32s: %d", "FET_Short_Fault", fault->reg_val.values.fet_short_fault);
+  printf("\n%-32s: %d", "On_Fault", fault->reg_val.values.on_fault);
+  printf("\n%-32s: %d", "Power_Bad_Fault", fault->reg_val.values.power_bad_fault);
+  printf("\n%-32s: %d", "OC_Fault", fault->reg_val.values.oc_fault);
+  printf("\n%-32s: %d", "UV_Fault", fault->reg_val.values.uv_fault);
+  printf("\n%-32s: %d", "OV_Fault", fault->reg_val.values.ov_fault);
   printf("\n");
 }
 
 static void print_pem_adc_alert_reg(pem_adc_alert_t *adc_alert_log) {
-  printf("\n%-32s: %d", "Power Alarm High", adc_alert_log->reg_val.values.power_alarm_high);
-  printf("\n%-32s: %d", "Power Alarm Low", adc_alert_log->reg_val.values.power_alarm_low);
-  printf("\n%-32s: %d", "Vsense Alarm High", adc_alert_log->reg_val.values.vsense_alarm_high);
-  printf("\n%-32s: %d", "Vsense Alarm Low", adc_alert_log->reg_val.values.vsense_alarm_low);
-  printf("\n%-32s: %d", "VSourve Alarm High", adc_alert_log->reg_val.values.vsource_alarm_high);
-  printf("\n%-32s: %d", "VSourve Alarm Low", adc_alert_log->reg_val.values.vsource_alarm_low);
-  printf("\n%-32s: %d", "VGPIO Alarm High", adc_alert_log->reg_val.values.vgpio_alarm_high);
-  printf("\n%-32s: %d", "VGPIO Alarm Low", adc_alert_log->reg_val.values.vgpio_alarm_low);
+  printf("\n%-32s: %d", "Power_Alarm_High", adc_alert_log->reg_val.values.power_alarm_high);
+  printf("\n%-32s: %d", "Power_Alarm_Low", adc_alert_log->reg_val.values.power_alarm_low);
+  printf("\n%-32s: %d", "Vsense_Alarm_High", adc_alert_log->reg_val.values.vsense_alarm_high);
+  printf("\n%-32s: %d", "Vsense_Alarm_Low", adc_alert_log->reg_val.values.vsense_alarm_low);
+  printf("\n%-32s: %d", "VSourve_Alarm_High", adc_alert_log->reg_val.values.vsource_alarm_high);
+  printf("\n%-32s: %d", "VSourve_Alarm_Low", adc_alert_log->reg_val.values.vsource_alarm_low);
+  printf("\n%-32s: %d", "VGPIO_Alarm_High", adc_alert_log->reg_val.values.vgpio_alarm_high);
+  printf("\n%-32s: %d", "VGPIO_Alarm_Low", adc_alert_log->reg_val.values.vgpio_alarm_low);
   printf("\n");
 }
 
@@ -740,10 +961,11 @@ static int pem_status_regs(uint8_t num, int option, pem_status_regs_t *status_re
   if (option != READ)
     return -1;
 
-  pem[num].fd = i2c_open(pem[num].bus, pem[num].chip_addr[LTC4282]);
+  pem[num].fd = i2c_cdev_slave_open(pem[num].bus, pem[num].chip_addr[LTC4282],
+                                    I2C_SLAVE_FORCE_CLAIM);
   if (pem[num].fd < 0) {
     ERR_PRINT("Fail to open i2c");
-    return -1;
+    return pem[num].fd;
   }
 
   pem_reg_read(pem[num].fd, FAULT_LOG, &value);
@@ -758,6 +980,51 @@ static int pem_status_regs(uint8_t num, int option, pem_status_regs_t *status_re
   return 0;
 }
 
+static
+int pem_firmware_regs(int fd, int option, pem_firmware_regs_t *firmware_regs) {
+  int value = 0;
+
+  if (option != READ)
+    return -1;
+
+  if (fd < 0) {
+    ERR_PRINT("Fail to open i2c");
+    return fd;
+  }
+
+  pem_reg_read(fd, APP_FW_MAJOR, &value);
+  firmware_regs->app_fw_major = value;
+  pem_reg_read(fd, APP_FW_MINOR, &value);
+  firmware_regs->app_fw_minor = value;
+  pem_reg_read(fd, BL_FW_MAJOR, &value);
+  firmware_regs->bl_fw_major = value;
+  pem_reg_read(fd, BL_FW_MINOR, &value);
+  firmware_regs->bl_fw_minor = value;
+
+  return 0;
+}
+
+int log_pem_critical_regs(uint8_t num) {
+  pem_status_regs_t status_regs;
+  int ret = 0;
+
+  ret = pem_status_regs(num, READ, &status_regs);
+
+  if(ret) {
+    OBMC_ERROR(ret, "Failed to read PEM %d FAULT_LOG/ADC_ALERT_LOG/STATUS registers", num + 1);
+    return ret;
+  }
+
+  OBMC_CRIT("PEM %d [FAULT_LOG addr: 0x%02x, value: 0x%02x] " \
+                   "[ADC_ALERT_LOG addr: 0x%02x, value: 0x%02x] " \
+                   "[STATUS addr: 0x%02x, value: 0x%04x]", num + 1,
+                    smbus_ltc4282[FAULT_LOG].reg, status_regs.fault.reg_val.value,
+                    smbus_ltc4282[ADC_ALERT_LOG].reg, status_regs.adc_alert_log.reg_val.value,
+                    smbus_ltc4282[STATUS].reg, status_regs.status.reg_val.value);
+
+  return ret;
+}
+
 /*
  * dump ltc4282 eeprom regs
  */
@@ -765,7 +1032,8 @@ static int pem_eeprom_regs(uint8_t num, int option, pem_eeprom_reg_t *eeprom_reg
   if (option != READ && option != WRITE)
     return -1;
 
-  pem[num].fd = i2c_open(pem[num].bus, pem[num].chip_addr[LTC4282]);
+  pem[num].fd = i2c_cdev_slave_open(pem[num].bus, pem[num].chip_addr[LTC4282],
+                                    I2C_SLAVE_FORCE_CLAIM);
   if (pem[num].fd < 0) {
     ERR_PRINT("Fail to open i2c");
     return -1;
@@ -930,6 +1198,9 @@ int get_eeprom_info(uint8_t num, const char *option) {
 int get_pem_info(uint8_t num) {
   struct wedge_eeprom_st fruid;
   pem_status_regs_t status_regs;
+  pem_firmware_regs_t firmware_regs = {0};
+  int ret;
+  uint8_t pem_model[I2C_SMBUS_BLOCK_MAX + 1] = {0};
 
   printf("\n%-32s: PEM%d (Bus:%d Addr:0x%x)", "PEM Information",
          num + 1, pem[num].bus, pem[num].chip_addr[LTC4282]);
@@ -945,6 +1216,28 @@ int get_pem_info(uint8_t num) {
     printf("\n%-32s: %s", "System Manufacturing Date",
            fruid.fbw_system_manufacturing_date);
     printf("\n");
+  }
+
+  ret = get_mfr_model(num, pem_model);
+  if (ret == 0) {
+    if (!strncmp((const char *)pem_model, DELTA_MODEL, strlen(DELTA_MODEL))) {
+      if (pem[num].fd < 0) {
+        pem[num].fd = i2c_cdev_slave_open(pem[num].bus,
+                                          pem[num].chip_addr[LTC4282],
+                                          I2C_SLAVE_FORCE_CLAIM);
+      }
+      ret = pem_firmware_regs(pem[num].fd, READ, &firmware_regs);
+      if (ret == 0) {
+        printf("\n%-32s: PEM%d (Bus:%d Addr:0x%x)", "PEM Firmware Info",
+            num + 1, pem[num].bus, pem[num].chip_addr[LTC4282]);
+        printf("\n%-32s: %s", "---------------", "-----------------------");
+        printf("\n%-32s: %d.%d", "Application Version", firmware_regs.app_fw_major,
+              firmware_regs.app_fw_minor);
+        printf("\n%-32s: %d.%d", "Bootloader Version", firmware_regs.bl_fw_major,
+              firmware_regs.bl_fw_minor);
+        printf("\n");
+      }
+    }
   }
 
   printf("\n%-32s: PEM%d (Bus:%d Addr:0x%x)", "PEM Hot Swap status",
@@ -965,7 +1258,8 @@ int get_blackbox_info(uint8_t num, const char *option) {
   pem_eeprom_reg_t eeprom_reg;
   pem_status_regs_t status_regs;
 
-  pem[num].fd = i2c_open(pem[num].bus, pem[num].chip_addr[LTC4282]);
+  pem[num].fd = i2c_cdev_slave_open(pem[num].bus, pem[num].chip_addr[LTC4282],
+                                    I2C_SLAVE_FORCE_CLAIM);
   if (pem[num].fd < 0) {
     ERR_PRINT("Fail to open i2c");
     return -1;
@@ -1002,4 +1296,416 @@ int get_blackbox_info(uint8_t num, const char *option) {
   close(pem[num].fd);
 
   return 0;
+}
+
+int get_archive_log(uint8_t num, const char *option) {
+
+  if ((!strncmp(option, "--print", strlen("--print")))) {
+    return decode_pem_backup_log(num);
+  } else if ((!strncmp(option, "--clear", strlen("--clear")))) {
+    printf("Not support!\n");
+    return 0;
+  } else {
+    printf("Invalid option!\n");
+    close(pem[num].fd);
+    return -1;
+  }
+
+}
+
+static int
+delta_check_fw_version(uint8_t num) {
+  pem_firmware_regs_t firmware_regs = {0};
+  int ret;
+  uint16_t app_fw_ver, bl_fw_ver;
+  uint16_t eep_app_fw_ver, eep_bl_fw_ver;
+
+  ret = pem_firmware_regs(pem[num].fd, READ, &firmware_regs);
+  if (ret != 0) {
+    ERR_PRINT("delta_check_fw_version()");
+    return -1;
+  }
+
+  app_fw_ver = (delta_hdr.app_fw_major << 8) | delta_hdr.app_fw_minor;
+  bl_fw_ver = (delta_hdr.bl_fw_major << 8) | delta_hdr.bl_fw_minor;
+
+  eep_app_fw_ver = (firmware_regs.app_fw_major << 8) | firmware_regs.app_fw_minor;
+  eep_bl_fw_ver = (firmware_regs.bl_fw_major << 8) | firmware_regs.bl_fw_minor;
+  if (app_fw_ver == eep_app_fw_ver && bl_fw_ver == eep_bl_fw_ver) {
+    /* FW is identical */
+    return FW_IDENTICAL;
+  }
+
+  return 0;
+
+}
+
+static int
+check_file_len(const char *file_path) {
+  int size;
+  struct stat st;
+
+  if (stat(file_path, &st) != 0) {
+    ERR_PRINT("check_file_len()");
+    return -1;
+  }
+
+  size = st.st_size;
+
+  return size;
+}
+
+static int
+delta_img_hdr_parse(const char *file_path) {
+  int ret;
+  int i;
+  int fd_file = -1;
+  int index = 0;
+  uint8_t hdr_buf[DELTA_HDR_LENGTH];
+
+  fd_file = open(file_path, O_RDONLY, 0666);
+  if (fd_file < 0) {
+    ERR_PRINT("delta_img_hdr_parse(): open()");
+    return -1;
+  }
+  ret = read(fd_file, hdr_buf, DELTA_HDR_LENGTH);
+  if (ret != DELTA_HDR_LENGTH) {
+      ERR_PRINT("delta_img_hdr_parse(): read()");
+      if(close(fd_file)) {
+        ERR_PRINT("delta_img_hdr_parse(): close()");
+      }
+      return -1;
+  }
+  if(close(fd_file)) {
+    ERR_PRINT("delta_img_hdr_parse(): close()");
+    return -1;
+  }
+
+  delta_hdr.crc[0] = hdr_buf[index++];
+  delta_hdr.crc[1] = hdr_buf[index++];
+  delta_hdr.page_start = hdr_buf[index++];
+  delta_hdr.page_start = ( delta_hdr.page_start << 8 ) | hdr_buf[index++];
+  delta_hdr.page_end = hdr_buf[index++];
+  delta_hdr.page_end = ( delta_hdr.page_end << 8 ) | hdr_buf[index++];
+  delta_hdr.byte_per_blk = hdr_buf[index++];
+  delta_hdr.byte_per_blk =( delta_hdr.byte_per_blk << 8 ) | hdr_buf[index++];
+  delta_hdr.blk_per_page = hdr_buf[index++];
+  delta_hdr.blk_per_page = ( delta_hdr.blk_per_page << 8 ) | hdr_buf[index++];
+  delta_hdr.uc = hdr_buf[index++];
+  delta_hdr.app_fw_major = hdr_buf[index++];
+  delta_hdr.app_fw_minor = hdr_buf[index++];
+  delta_hdr.bl_fw_major = hdr_buf[index++];
+  delta_hdr.bl_fw_minor = hdr_buf[index++];
+  delta_hdr.fw_id_len = hdr_buf[index++];
+
+  for (i = 0; i < delta_hdr.fw_id_len; i++) {
+    delta_hdr.fw_id[i] = hdr_buf[index++];
+  }
+  delta_hdr.compatibility = hdr_buf[index];
+
+  if (!strncmp((const char *)delta_hdr.fw_id, DELTA_MODEL, strlen(DELTA_MODEL))) {
+    printf("Vendor: Delta\n");
+    printf("Model: %s\n", delta_hdr.fw_id);
+    printf("HW Compatibility: %d\n", delta_hdr.compatibility);
+    if (delta_hdr.uc == 0x10) {
+      printf("MCU: primary\n");
+    } else if (delta_hdr.uc == 0x20) {
+      printf("MCU: secondary\n");
+    } else {
+      printf("MCU: unknown number 0x%x\n", delta_hdr.uc);
+      return -1;
+    }
+    printf("Ver: %d.%d\n", delta_hdr.app_fw_major, delta_hdr.app_fw_minor);
+    return DELTA_PEM;
+  } else {
+    printf("Get Image Header Fail!\n");
+    return -1;
+  }
+}
+
+static int
+delta_unlock_upgrade(uint8_t num) {
+  uint8_t block[I2C_SMBUS_BLOCK_MAX] = {delta_hdr.uc, 
+                                        delta_hdr.fw_id[10], delta_hdr.fw_id[9],
+                                        delta_hdr.fw_id[8], delta_hdr.fw_id[7],
+                                        delta_hdr.fw_id[6], delta_hdr.fw_id[5],
+                                        delta_hdr.fw_id[4], delta_hdr.fw_id[3],
+                                        delta_hdr.fw_id[2], delta_hdr.fw_id[1],
+                                        delta_hdr.fw_id[0], delta_hdr.compatibility};
+
+  printf("-- Unlock Upgrade --\n");
+  int ret = i2c_smbus_write_block_data(pem[num].fd, UNLOCK_UPGRADE, 13, block);
+  if (ret < 0) {
+    printf("Unlock upgrade failure\n");
+    return -1;
+  }
+  else
+    return 0;
+}
+
+static int
+delta_boot_flag(uint8_t num, uint16_t mode) {
+  int ret;
+  uint16_t word = (mode << 8) | delta_hdr.uc;
+
+  printf("-- %s --\n", mode == BOOT_MODE ? "Bootloader Mode" : "Reset PEM");
+  ret = i2c_smbus_write_word_data(pem[num].fd, BOOT_FLAG, word);
+  if (ret < 0) {
+    printf("Failed to %s\n", mode == BOOT_MODE ? "set to bootloader mode" : "reset PEM");
+    return -1;
+  }
+  else
+    return 0;
+}
+
+static int
+delta_fw_transmit(uint8_t num, const char *path) {
+  int ret;
+  FILE* fp;
+  int fw_len = 0;
+  int block_total = 0;
+  int byte_index = 0;
+  int fw_block = (delta_hdr.uc == 0x10)
+                 ? DELTA_PRI_NUM_OF_BLOCK * DELTA_PRI_NUM_OF_PAGE
+                 : DELTA_SEC_NUM_OF_BLOCK * DELTA_SEC_NUM_OF_PAGE;
+  uint8_t page_num_lo = (delta_hdr.uc == 0x10) ? DELTA_PRI_PAGE_START
+                                               : DELTA_SEC_PAGE_START;
+  uint8_t block_size = (delta_hdr.uc == 0x10) ? DELTA_PRI_NUM_OF_BLOCK
+                                              : DELTA_SEC_NUM_OF_BLOCK;
+  uint8_t page_num_max = (delta_hdr.uc == 0x10) ? DELTA_PRI_PAGE_END
+                                                : DELTA_SEC_PAGE_END;
+  uint8_t block[I2C_SMBUS_BLOCK_MAX] = {0};
+  uint8_t fw_buf[16];
+
+  fw_len = check_file_len(path) - 32;
+
+  uint8_t fw_data[fw_len];
+
+  fp = fopen(path, "rb");
+  if (fp == NULL) {
+    ERR_PRINT("delta_fw_transmit(): fopen()");
+    return -1;
+  }
+  ret = fseek(fp, 32, SEEK_SET);
+  if (ret < 0) {
+    ERR_PRINT("delta_fw_transmit(): fseek()");
+    goto err_exit;
+  }
+  ret = fread(fw_data, sizeof(uint8_t), fw_len, fp);
+  if (ret != fw_len) {
+    ret = feof(fp);
+    if (ret < 0) {
+      ERR_PRINT("delta_fw_transmit(): fread()");
+      goto err_exit;
+    }
+  }
+
+  if (delta_hdr.uc == 0x10) {
+    printf("-- Transmit Primary Firmware --\n");
+  } else if (delta_hdr.uc == 0x20){
+    printf("-- Transmit Secondary Firmware --\n");
+  }
+
+  /* Send date to PEM, use 16bytes mode */
+  while (block_total <= fw_block) {
+    block[0] = delta_hdr.uc;
+
+    /* block[1] - Block Num LO
+       block[2] - Block Num HI */
+    if (block[1] < block_size) {
+      memcpy(&fw_buf[0], &fw_data[byte_index], 16);
+      memcpy(&block[3], &fw_buf, 16);
+      ret = i2c_smbus_write_block_data(pem[num].fd, DATA_TO_RAM, 19, block);
+      if (ret < 0) {
+        printf("Send data to RAM failure\n");
+        goto err_exit;
+      }
+      /*
+       * The delay between two blocks of data.
+       * It should be no less than 5ms, 10ms is recommended.
+       */
+      if (delta_hdr.uc == 0x10) {
+        msleep(10);
+      } else if (delta_hdr.uc == 0x20) {
+        msleep(10);
+      }
+
+      block[1]++;
+      block[2] = 0;
+      block_total++;
+      byte_index = byte_index + 16;
+      printf("-- (%d/%d) (%d%%/100%%) --\r",
+                  block_total, fw_block, (100 * block_total) / fw_block);
+    } else {
+      block[1] = page_num_lo;
+      block[2] = 0;
+      ret = i2c_smbus_write_block_data(pem[num].fd, DATA_TO_FLASH, 3, block);
+      if (ret < 0) {
+        printf("Send data to flash failure\n");
+        goto err_exit;
+      }
+      /*
+       * The delay between write data to flash command F3h and write CRC value command F4h.
+       * It should be no less than 50ms, 90ms is recommended.
+       */
+      msleep(90);
+      if (page_num_lo == page_num_max) {
+        printf("\n");
+        goto exit;
+      } else {
+        page_num_lo++;
+        block[1] = 0;
+      }
+    }
+  }
+
+exit:
+  ret = 0;
+
+err_exit:
+  ret = fclose(fp);
+  if (ret < 0) {
+    ERR_PRINT("delta_fw_transmit(): fclose()");
+  }
+  return ret;
+}
+
+static int
+delta_crc_transmit(uint8_t num) {
+  uint8_t block[I2C_SMBUS_BLOCK_MAX] =
+                     {delta_hdr.uc, delta_hdr.crc[0], delta_hdr.crc[1]};
+
+  printf("-- Transmit CRC --\n");
+  int ret = i2c_smbus_write_block_data(pem[num].fd, CRC_CHECK, 3, block);
+  if (ret < 0) {
+    printf("CRC check failure\n");
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+update_delta_pem(uint8_t num, const char *file_path, _Bool force) {
+  int ret = 0;
+  if (delta_img_hdr_parse(file_path) == DELTA_PEM) {
+    if (!force) {
+      printf("-- Check Version --\n");
+      ret = delta_check_fw_version(num);
+      if (ret != 0) {
+        return ret;
+      }
+    }
+    ret = delta_unlock_upgrade(num);
+    if (ret < 0)
+      goto err_exit;
+    /*
+     * The delay between unlock command F0h and set boot flag command F1h.
+     * It should be no less than 10ms, 20ms is recommended.
+     */
+    msleep(20);
+    ret = delta_boot_flag(num, BOOT_MODE);
+    if (ret < 0)
+      goto err_exit;
+    /*
+     * The delay between unlock command F1h and send data command F2h.
+     * It should be no less than 1500ms, 2500ms is recommended.
+     */
+    msleep(2500);
+    ret = delta_fw_transmit(num, file_path);
+    if (ret < 0)
+      goto err_exit;
+    ret = delta_crc_transmit(num);
+    if (ret < 0)
+      goto err_exit;
+    /*
+     * The delay between write CRC value command F4h and reset boot flag command F1h.
+     * It should be no less than 800, 1500ms is recommended.
+     */
+    msleep(1500);
+    ret = delta_boot_flag(num, NORMAL_MODE);
+
+    /*
+     * The delay from reset boot flag command to power supply back to normal working status,
+     * which allowed to process the next controller.
+     * It should be no less than 1000, 2000ms is recommended.
+     */
+    if (delta_hdr.uc == 0x10) {
+      msleep(2000);
+    } else if (delta_hdr.uc == 0x20) {
+      msleep(2000);
+    }
+    printf("-- Upgrade Done --\n");
+    return 0;
+  }
+
+err_exit:
+  delta_boot_flag(num, NORMAL_MODE);
+  return -1;
+}
+
+int
+get_mfr_model(uint8_t num, uint8_t *block) {
+  int rc = -1;
+  struct wedge_eeprom_st fruid;
+
+  rc = i2c_smbus_read_block_data(pem[num].fd, PMBUS_MFR_MODEL, block);
+  if (rc < 0) {
+    rc = parse_pem_fru_eeprom(num, &fruid);
+    if (rc < 0) {
+      ERR_PRINT("get_mfr_model()");
+      return -1;
+    }
+    snprintf((char *)block, 33 , "%s", fruid.fbw_odm_pcba_number);
+  }
+
+  return 0;
+}
+
+int
+do_update_pem(uint8_t num, const char *file_path, const char *vendor, _Bool force) {
+  int ret = -1;
+  uint8_t block[I2C_SMBUS_BLOCK_MAX + 1] = {0};
+
+  signal(SIGHUP, exithandler);
+  signal(SIGINT, exithandler);
+  signal(SIGTERM, exithandler);
+  signal(SIGQUIT, exithandler);
+
+  sensord_operation(num, STOP);
+  pal_del_i2c_device(pem[num].bus, pem[num].chip_addr[LTC4282]);
+  pal_del_i2c_device(pem[num].bus, pem[num].chip_addr[MAX6615]);
+
+  pem[num].fd = i2c_cdev_slave_open(pem[num].bus, pem[num].chip_addr[LTC4282],
+                                    I2C_SLAVE_FORCE_CLAIM);
+  g_fd = pem[num].fd;
+  if (pem[num].fd < 0) {
+    ERR_PRINT("Fail to open i2c");
+    return -1;
+  }
+
+  if (vendor == NULL) {
+    ret = get_mfr_model(num, block);
+    if (ret < 0) {
+      printf("Cannot Get PEM Model\n");
+      return -1;
+    }
+  }
+
+  if ((vendor == NULL && !strncmp((const char *)block, DELTA_MODEL, strlen(DELTA_MODEL))) ||
+      !strncasecmp(vendor, "delta", strlen("delta"))) {
+      ret = update_delta_pem(num, file_path, force);
+    } else {
+      printf("Unsupported vendor: %s\n", vendor);
+      return -1;
+  }
+
+  if (ret == 0 || ret == FW_IDENTICAL) {
+    sensord_operation(num, START);
+    pal_add_i2c_device(pem[num].bus, pem[num].chip_addr[LTC4282], PEM_LTC4282_DRIVER);
+    pal_add_i2c_device(pem[num].bus, pem[num].chip_addr[MAX6615], PEM_MAX6615_DRIVER);
+  }
+  close(pem[num].fd);
+
+  return ret;
 }

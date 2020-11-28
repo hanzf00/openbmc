@@ -17,6 +17,8 @@
 
 using namespace std;
 
+#ifndef __TEST__
+
 int System::runcmd(const string &cmd)
 {
 #ifdef DEBUG
@@ -43,7 +45,7 @@ int System::vboot_support_status(void)
   return VBOOT_NO_ENFORCE;
 }
 
-bool System::get_mtd_name(string name, string &dev)
+bool System::get_mtd_name(string name, string &dev, size_t& size, size_t& erasesize)
 {
   FILE* partitions = fopen("/proc/mtd", "r");
   char line[256], mnt_name[32];
@@ -58,11 +60,14 @@ bool System::get_mtd_name(string name, string &dev)
     return false;
   }
   while (fgets(line, sizeof(line), partitions)) {
-    if(sscanf(line, "mtd%d: %*x %*x %s",
-                &mtdno, mnt_name) == 2) {
+    size_t sz, esz;
+    if(sscanf(line, "mtd%d: %zx %zx %s",
+                &mtdno, &sz, &esz, mnt_name) == 4) {
       if(!strcmp(name.c_str(), mnt_name)) {
         dev = "/dev/mtd";
         dev.append(to_string(mtdno));
+        size = sz;
+        erasesize = esz;
         found = true;
         break;
       }
@@ -79,7 +84,7 @@ string System::version()
     char vers[128] = "NA";
     FILE *fp = fopen("/etc/issue", "r");
     if (fp) {
-      if (fscanf(fp, "OpenBMC Release %s\n", vers) == 1) {
+      if (fscanf(fp, "OpenBMC Release %127s\n", vers) == 1) {
         ret = vers;
       }
       fclose(fp);
@@ -112,7 +117,9 @@ void System::set_update_ongoing(uint8_t fru_id, int timeo)
   pal_set_fw_update_ongoing(fru_id, timeo);
 }
 
-string System::lock_file(string &name)
+bool System::is_update_ongoing(uint8_t fru_id)
 {
-  return "/var/run/fw-util-" + name + ".lock";
+  return pal_is_fw_update_ongoing(fru_id);
 }
+
+#endif

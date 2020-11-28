@@ -44,8 +44,9 @@ class BMCMachine(object):
     def __init__(self):
         self.frus = set()
         self.nums = {}
+        self.last_fan_speed = {}
 
-    def read_sensors(self, sensor_sources):
+    def read_sensors(self, sensor_sources,inf):
         """
         Method to read all sensors
 
@@ -57,7 +58,41 @@ class BMCMachine(object):
         """
         sensors = {}
         for fru in self.frus:
-            sensors[fru] = get_sensor_tuples(fru, self.nums[fru], sensor_sources)
+            sensors[fru] = get_sensor_tuples(fru, self.nums[fru], sensor_sources,inf)
+
+        Logger.debug("Last fan speed : %d" % self.last_fan_speed)
+        Logger.debug("Sensor reading")
+
+        # Offset the sensor Temp value
+        for key, data in list(sensor_sources.items()):
+            sensorname = key.lower()
+
+            for fru in self.frus:
+                if sensorname in sensors[fru]:
+                    senvalue = sensors[fru][sensorname]
+                    Logger.debug(" {} = {}".format(sensorname, senvalue.value))
+
+            offset = 0
+            if data.offset != None:
+                offset = data.offset
+            elif data.offset_table != None:
+                # Offset sensor Temp, relate with current fan speed
+                for (fan_speed, offset_temp) in sorted(data.offset_table):
+                    if self.last_fan_speed > fan_speed:
+                        offset = offset_temp
+                    else:
+                        break
+            if offset != 0:
+                for fru in self.frus:
+                    if sensorname in sensors[fru]:
+                        senvalue = sensors[fru][sensorname]
+                        value = senvalue.value + offset
+                        sensors[fru][sensorname] = senvalue._replace(value=value)
+                        value = senvalue.value + offset
+                        Logger.debug(
+                            " %s = %.2f (after offset %.2f)"
+                            % (sensorname, value, offset)
+                        )
         return sensors
 
     def read_fans(self, fans):
@@ -94,6 +129,7 @@ class BMCMachine(object):
         """
         Logger.debug("Set pwm %d to %d" % (int(fan.source.name), pct))
         fan.source.write(pct)
+        self.last_fan_speed = pct
 
     def set_all_pwm(self, fans, pct):
         """
@@ -111,7 +147,7 @@ class BMCMachine(object):
             self.set_pwm(fans[key], pct)
 
 
-def get_sensor_tuples(fru_name, sensor_num, sensor_sources):
+def get_sensor_tuples(fru_name, sensor_num, sensor_sources,inf):
     """
     Method to walk through each of the sensor sources to build the tuples
     of the form 'SensorValue'
@@ -126,7 +162,7 @@ def get_sensor_tuples(fru_name, sensor_num, sensor_sources):
     for key, value in list(sensor_sources.items()):
         if isinstance(value.source, FscSensorSourceUtil):
             result = parse_all_sensors_util(
-                sensor_sources[key].source.read(fru=fru_name, num=sensor_num)
+                sensor_sources[key].source.read(fru=fru_name, num=sensor_num, inf=inf)
             )
             break  # Hack: util reads all sensors
         elif isinstance(sensor_sources.get(key).source, FscSensorSourceSysfs):

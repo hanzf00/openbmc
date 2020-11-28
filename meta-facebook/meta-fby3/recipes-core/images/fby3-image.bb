@@ -1,36 +1,27 @@
 # Copyright 2018-present Facebook. All Rights Reserved.
 
-inherit kernel_fitimage
+require recipes-core/images/fbobmc-image-meta.inc
+require fby3-image-layout.inc
+
+IMAGE_FSTYPES_remove = "cpio.lzma.u-boot"
+IMAGE_FSTYPES += "cpio.zst.u-boot"
 
 require recipes-core/images/fb-openbmc-image.bb
 
-# The offset must match with the offsets defined in
-# dev-spi-cmm.c. Rootfs starts from 4.5M
-FLASH_ROOTFS_OFFSET = "4608"
-# plat-utils
 # sensor-setup
-# bic-cached
-# bic-util
-# fby2-sensors
-# gpiod
-# gpiointrd
-# front-paneld
 # hsvc-util
 # fpc-util
 # imc-util
-# me-util
-# crashdump
-# guid-util
 # sensordump
 # enclosure-util
 # nvme-util
-# ipmbd
 
 # Include modules in rootfs
 IMAGE_INSTALL += " \
   healthd \
   fan-util \
   fscd \
+  ipmbd \
   ipmid \
   packagegroup-openbmc-base \
   packagegroup-openbmc-net \
@@ -44,9 +35,8 @@ IMAGE_INSTALL += " \
   mterm\
   cfg-util \
   fw-util \
-  log-util \
+  log-util-v2 \
   lldp-util \
-  spatula \
   openbmc-utils \
   ipmi-util \
   asd \
@@ -54,20 +44,25 @@ IMAGE_INSTALL += " \
   bios-util \
   threshold-util \
   libncsi \
-  ncsid \
   vboot-utils \
   libpldm \
-  "
-
-IMAGE_FEATURES += " \
-  ssh-server-openssh \
-  tools-debug \
-  "
-
-DISTRO_FEATURES += " \
-  ext2 \
-  ipv6 \
-  nfs \
-  usbgadget \
-  usbhost \
+  plat-utils \
+  i2craw \
+  bic-util \
+  me-util \
+  bic-cached \
+  guid-util \
+  gpiod \
+  front-paneld \
+  gpiointrd \
+  crashdump \
+  show-sys-config \
+  slot-util \
+  enclosure-util \
+  fpc-util \
+  at \
+  ncsid-v2 \
+  throttle-util \
+  name-util \
+  nvme-util \
   "

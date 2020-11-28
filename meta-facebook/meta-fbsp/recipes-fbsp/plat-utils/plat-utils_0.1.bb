@@ -22,13 +22,22 @@ LICENSE = "GPLv2"
 LIC_FILES_CHKSUM = "file://COPYING;md5=eb723b61539feef013de476e68b5c50a"
 
 SRC_URI = "file://ast-functions \
+           file://sol-util \
            file://setup-gpio.sh \
+           file://setup-i2c.sh \
+           file://sync_date.sh \
+           file://setup-por.sh \
+           file://setup-clock-port.sh \
+           file://setup-pfr.sh \
            file://COPYING \
           "
 
 pkgdir = "utils"
 
 S = "${WORKDIR}"
+
+binfiles = "sol-util \
+           "
 
 RDEPENDS_${PN} += "gpiocli"
 DEPENDS_append = "update-rc.d-native"
@@ -39,11 +48,26 @@ do_install() {
   install -m 644 ast-functions ${dst}/ast-functions
   localbindir="${D}/usr/local/bin"
   install -d ${localbindir}
+  for f in ${binfiles}; do
+      install -m 755 $f ${dst}/${f}
+      ln -s ../fbpackages/${pkgdir}/${f} ${localbindir}/${f}
+  done
+
   # init
   install -d ${D}${sysconfdir}/init.d
   install -d ${D}${sysconfdir}/rcS.d
   install -m 755 setup-gpio.sh ${D}${sysconfdir}/init.d/setup-gpio.sh
   update-rc.d -r ${D} setup-gpio.sh start 59 5 .
+  install -m 755 setup-i2c.sh ${D}${sysconfdir}/init.d/setup-i2c.sh
+  update-rc.d -r ${D} setup-i2c.sh start 60 5 .
+  install -m 755 sync_date.sh ${D}${sysconfdir}/init.d/sync_date.sh
+  update-rc.d -r ${D} sync_date.sh start 66 5 .
+  install -m 755 setup-pfr.sh ${D}${sysconfdir}/init.d/setup-pfr.sh
+  update-rc.d -r ${D} setup-pfr.sh start 99 5 .
+  install -m 755 setup-por.sh ${D}${sysconfdir}/init.d/setup-por.sh
+  update-rc.d -r ${D} setup-por.sh start 70 S .
+  install -m 755 setup-clock-port.sh ${D}${sysconfdir}/init.d/setup-clock-port.sh
+  update-rc.d -r ${D} setup-clock-port.sh start 80 S .
 }
 
 FILES_${PN} += "/usr/local ${sysconfdir}"

@@ -7,10 +7,11 @@ SRC_URI = "https://pypi.python.org/packages/e5/04/b272ba67ed896c5e9ac05cac916da6
 SRC_URI[md5sum] = "7837353cf71008484e99737ccf55a4ea"
 SRC_URI[sha256sum] = "9ec33a1da4d2096949e29ddd66a352aae57fad6b5483087d54566a2f6345ae10"
 
-S = "${WORKDIR}/${PN}-${PV}"
+S = "${WORKDIR}/${BPN}-${PV}"
 
-dst="/usr/lib/python3.5/site-packages/multidict.egg-info"
-dst1="/usr/lib/python3.5/site-packages/multidict"
+inherit python3-dir
+dst="${PYTHON_SITEPACKAGES_DIR}/multidict.egg-info"
+dst1="${PYTHON_SITEPACKAGES_DIR}/multidict"
 
 do_install() {
   mkdir -p ${D}/${dst}
@@ -33,3 +34,4 @@ do_compile() {
 }
 
 FILES_${PN} = "${dst} ${dst1}"
+BBCLASSEXTEND += "native nativesdk"

@@ -56,6 +56,7 @@
 #define LTC4281_POWER_ALARM_MIN   0x0E
 #define LTC4281_POWER_ALARM_MAX   0x0F
 #define LTC4281_ILIM_ADJUST       0x11
+#define LTC4281_ALERT_CONTROL     0x1C
 #define LTC4281_ADC_CONTROL       0x1D
 #define LTC4281_STATUS_LSB        0x1E
 #define LTC4281_STATUS_MSB        0x1F
@@ -435,11 +436,11 @@ static const i2c_dev_attr_st ltc4281_attr_table[] = {
     0x0, 0, 0,
   },
   {
-    "curr1_input",
+    "in2_input",
     NULL,
-    ltc_curr_show,
+    ltc_vgpio_show,
     NULL,
-    LTC4281_VSENSE_MSB, 0, 16,
+    LTC4281_VGPIO_MSB, 0, 16,
   },
   {
     "in2_label",
@@ -449,11 +450,25 @@ static const i2c_dev_attr_st ltc4281_attr_table[] = {
     0x0, 0, 0,
   },
   {
-    "in2_input",
+    "in3_input",
     NULL,
-    ltc_vgpio_show,
+    I2C_DEV_ATTR_SHOW_DEFAULT,
     NULL,
-    LTC4281_VGPIO_MSB, 0, 16,
+    LTC4281_FAULT_LOG, 6, 1,
+  },
+  {
+    "in3_label",
+    "MOSFET Bad",
+    i2c_dev_show_label,
+    NULL,
+    0x0, 0, 0,
+  },
+  {
+    "curr1_input",
+    NULL,
+    ltc_curr_show,
+    NULL,
+    LTC4281_VSENSE_MSB, 0, 16,
   },
   {
     "curr1_label",
@@ -513,6 +528,15 @@ static const i2c_dev_attr_st ltc4281_attr_table[] = {
     I2C_DEV_ATTR_SHOW_DEFAULT,
     I2C_DEV_ATTR_STORE_DEFAULT,
     LTC4281_ILIM_ADJUST, 1, 1,
+  },
+  {
+    "alert_generated",
+    "This bit is set to 1 when an alert is generated.\n"
+    "It must be manually cleared by writing a 0 to it via I2C.\n"
+    "This bit can be set via I2C to simulate an alert",
+    I2C_DEV_ATTR_SHOW_DEFAULT,
+    I2C_DEV_ATTR_STORE_DEFAULT,
+    LTC4281_ALERT_CONTROL, 7, 1,
   },
   {
     "fault_log_enable",

@@ -13,8 +13,8 @@ CFLAGS += "-D__MACHINE__=${MACHINE}"
 
 SRC_URI = "file://obmc-pal.h \
            file://obmc-pal.c \
-           file://obmc-sensor.c \
-           file://obmc-sensor.h \
+           file://obmc_pal_sensors.c \
+           file://obmc_pal_sensors.h \
            file://CMakeLists.txt \
           "
 DEPENDS += " libkv libipmi libipmb"

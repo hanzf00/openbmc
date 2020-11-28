@@ -18,7 +18,10 @@
 # Intended to compatible with both Python 2.7 and Python 3.x.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import datetime
 import errno
+import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -44,6 +47,127 @@ class TestSystem(unittest.TestCase):
         self.mock_mtd.size = 1
         self.mock_mtd.file_name = "/dev/mtd99"
         self.mock_mtd.offset = 0
+
+    @patch.object(system, "open", create=True)
+    def test_load_image_meta(self, mocked_open):
+        test_meta = {
+            "FBOBMC_IMAGE_META_VER": 1,
+            "meta_update_action": "test",
+            "meta_update_time": "2020-08-08T21:10:08.825194",
+            "part_infos": (
+                {
+                    "md5": "919ac6ac169f9a005636cc4eb04d4f79",
+                    "name": "spl",
+                    "offset": 0,
+                    "size": 262144,
+                    "type": "rom",
+                },
+                {
+                    "md5": "4e418c602b037e8b2b826d9c359cc0e3",
+                    "name": "rec-u-boot",
+                    "offset": 262144,
+                    "size": 655360,
+                    "type": "raw",
+                },
+                {"name": "u-boot-env", "offset": 917504, "size": 65536, "type": "data"},
+                {"name": "image-meta", "offset": 983040, "size": 65536, "type": "meta"},
+                {
+                    "name": "u-boot-fit",
+                    "num-nodes": 1,
+                    "offset": 1048576,
+                    "size": 655360,
+                    "type": "fit",
+                },
+                {
+                    "name": "os-fit",
+                    "num-nodes": 3,
+                    "offset": 1703936,
+                    "size": 31850496,
+                    "type": "fit",
+                },
+            ),
+            "version_infos": {
+                "fw_ver": "fby3vboot2-v2020.33.0",
+                "uboot_build_time": "Aug 08 2020 - 19:17:09 +0000",
+                "uboot_ver": "2019.04",
+            },
+        }
+
+        test_meta_data = json.dumps(test_meta).encode("ascii")
+        test_meta_chksum = {"meta_md5": hashlib.md5(test_meta_data).hexdigest()}
+        test_meta_chksum_data = json.dumps(test_meta_chksum).encode("ascii")
+        data = test_meta_data + b"\n" + test_meta_chksum_data + b"\n"
+        mocked_open.return_value = mock_open(read_data=data).return_value
+        self.mock_image.size = 32 * 1024 * 1024
+        meta_info = system.load_image_meta(self.mock_image, self.logger)
+        self.assertEqual(
+            meta_info["FBOBMC_IMAGE_META_VER"], test_meta["FBOBMC_IMAGE_META_VER"]
+        )
+        self.assertEqual(meta_info["part_infos"], tuple(test_meta["part_infos"]))
+        self.assertEqual(meta_info["version_infos"], test_meta["version_infos"])
+        self.assertEqual(meta_info["meta_update_time"], test_meta["meta_update_time"])
+        self.assertEqual(
+            meta_info["meta_update_action"], test_meta["meta_update_action"]
+        )
+
+    @patch.object(system, "open", create=True)
+    def test_load_image_meta_ver(self, mocked_open):
+        for badver in [2, 0, -1, 100000, 1.0]:
+            test_meta = {
+                "FBOBMC_IMAGE_META_VER": badver,
+                "meta_update_action": "test",
+                "meta_update_time": "2020-08-06T18:18",
+            }
+            test_meta_data = json.dumps(test_meta).encode("ascii")
+            test_meta_chksum = {"meta_md5": hashlib.md5(test_meta_data).hexdigest()}
+            test_meta_chksum_data = json.dumps(test_meta_chksum).encode("ascii")
+            data = test_meta_data + b"\n" + test_meta_chksum_data + b"\n"
+            mocked_open.return_value = mock_open(read_data=data).return_value
+            self.mock_image.size = 32 * 1024 * 1024
+            with self.assertRaises(system.MetaPartitionVerNotSupport):
+                system.load_image_meta(self.mock_image, self.logger)
+
+    @patch.object(system, "open", create=True)
+    def test_load_image_meta_size(self, mocked_open):
+        self.mock_image.size = 32
+        with self.assertRaises(system.MetaPartitionNotFound):
+            system.load_image_meta(self.mock_image, self.logger)
+
+    @patch.object(system, "open", create=True)
+    def test_load_image_meta_corrupt(self, mocked_open):
+        test_meta = {"FBOBMC_IMAGE_META_VER": 1}
+        test_meta_data = json.dumps(test_meta).encode("ascii")
+        test_meta_chksum = {"meta_md5": hashlib.md5(b"afdafa").hexdigest()}
+        test_meta_chksum_data = json.dumps(test_meta_chksum).encode("ascii")
+        data = test_meta_data + b"\n" + test_meta_chksum_data + b"\n"
+        mocked_open.return_value = mock_open(read_data=data).return_value
+        self.mock_image.size = 32 * 1024 * 1024
+        with self.assertRaises(system.MetaPartitionCorrupted):
+            system.load_image_meta(self.mock_image, self.logger)
+
+    @patch.object(system, "open", create=True)
+    def test_load_image_meta_notfound(self, mocked_open):
+        data = b"fdadfaefe#"
+        mocked_open.return_value = mock_open(read_data=data).return_value
+        self.mock_image.size = 32 * 1024 * 1024
+        with self.assertRaises(system.MetaPartitionNotFound):
+            system.load_image_meta(self.mock_image, self.logger)
+
+    @patch.object(system, "open", create=True)
+    def test_load_image_meta_missing_partinfo(self, mocked_open):
+        test_meta = {
+            "FBOBMC_IMAGE_META_VER": 1,
+            "meta_update_action": "test",
+            "meta_update_time": "2020-08-06T18:18",
+        }
+        test_meta_data = json.dumps(test_meta).encode("ascii")
+        test_meta_chksum = {"meta_md5": hashlib.md5(test_meta_data).hexdigest()}
+        test_meta_chksum_data = json.dumps(test_meta_chksum).encode("ascii")
+        data = test_meta_data + b"\n" + test_meta_chksum_data + b"\n"
+        mocked_open.return_value = mock_open(read_data=data).return_value
+        self.mock_image.size = 32 * 1024 * 1024
+        with self.assertRaises(system.MetaPartitionMissingPartInfos):
+            system.load_image_meta(self.mock_image, self.logger)
 
     @patch.object(system, "open", create=True)
     def test_is_openbmc(self, mocked_open):
@@ -156,10 +280,27 @@ class TestSystem(unittest.TestCase):
             )
 
     @patch.object(subprocess, "check_call", autospec=True)
+    def test_helathd_reboot(self, mocked_check_call):
+        with patch("os.path.exists") as os_path_exists:
+            os_path_exists.return_value = True
+            system.restart_healthd(self.logger)
+        mocked_check_call.assert_called_with(["sv", "restart", "healthd"])
+
+    @patch.object(subprocess, "check_call", autospec=True)
+    def test_helathd_noreboot(self, mocked_check_call):
+        with patch("os.path.exists") as os_path_exists:
+            os_path_exists.return_value = False
+            system.restart_healthd(self.logger)
+        assert not mocked_check_call.called
+
+    @patch.object(subprocess, "check_call", autospec=True)
     def test_remove_healthd_reboot(self, mocked_check_call):
         data = """{"version":"1.0","heartbeat":{"interval":500},"bmc_cpu_utilization":{"enabled":true,"window_size":120,"monitor_interval":1,"threshold":[{"value":80,"hysteresis":5,"action":["log-critical","bmc-error-trigger"]}]},"bmc_mem_utilization":{"enabled":true,"enable_panic_on_oom":false,"window_size":120,"monitor_interval":1,"threshold":[{"value":60,"hysteresis":5,"action":["log-warning"]},{"value":70,"hysteresis":5,"action":["log-critical","bmc-error-trigger"]},{"value":80,"hysteresis":5,"action":["log-critical","reboot"]}]},"i2c":{"enabled":false,"busses":[0,1,2,3,4,5,6,7,8,9,10,11,12,13]},"ecc_monitoring":{"enabled":false,"ecc_address_log":false,"monitor_interval":2,"recov_max_counter":255,"unrec_max_counter":15,"recov_threshold":[{"value":0,"action":["log-critical","bmc-error-trigger"]},{"value":50,"action":["log-critical"]},{"value":90,"action":["log-critical"]}],"unrec_threshold":[{"value":0,"action":["log-critical","bmc-error-trigger"]},{"value":50,"action":["log-critical"]},{"value":90,"action":["log-critical"]}]},"bmc_health":{"enabled":false,"monitor_interval":2,"regenerating_interval":1200},"verified_boot":{"enabled":false}}"""  # noqa: E501
         # cov couldn't get a decorator version to surface .write()
-        with patch("system.open", new=mock_open(read_data=data)) as mock_file:
+        with patch("system.open", new=mock_open(read_data=data)) as mock_file, patch(
+            "time.sleep"
+        ), patch("os.path.exists") as os_path_exists:
+            os_path_exists.return_value = True
             system.remove_healthd_reboot(self.logger)
             self.assertNotIn(call().write('"reboot"'), mock_file.mock_calls)
         mocked_check_call.assert_called_with(["sv", "restart", "healthd"])
@@ -180,26 +321,28 @@ class TestSystem(unittest.TestCase):
     def test_flash_too_big(self, mocked_check_output):
         self.mock_image.size = 2
         with self.assertRaises(SystemExit) as context_manager:
-            system.flash(1, self.mock_image, self.mock_mtd, self.logger)
+            system.flash(1, self.mock_image, self.mock_mtd, self.logger, None)
             mocked_check_output.assert_not_called()
             self.assertEqual(context_manager.exception.code, 1)
 
+    @patch.object(os.path, "exists", return_value=False)
     @patch.object(system, "open", create=True)
     @patch.object(
         system, "glob", return_value=["/proc/123/cmdline", "/proc/self/cmdline"]
     )
     @patch.object(os, "getpid", return_value=123)
     def test_other_flasher_running_skip_self(
-        self, mocked_getpid, mocked_glob, mocked_open
+        self, mocked_getpid, mocked_glob, mocked_open, mocked_exists
     ):
         self.assertEqual(system.other_flasher_running(self.logger), False)
         mocked_open.assert_not_called()
 
+    @patch.object(os.path, "exists", return_value=False)
     @patch.object(system, "open", create=True)
     @patch.object(system, "glob")
     @patch.object(os, "getpid", return_value=123)
     def test_other_flasher_running_return_false(
-        self, mocked_getpid, mocked_glob, mocked_open
+        self, mocked_getpid, mocked_glob, mocked_open, mocked_exists
     ):
         read_data = [
             b"runsv\x00/etc/sv/restapi\x00",
@@ -217,11 +360,12 @@ class TestSystem(unittest.TestCase):
         ]
         self.assertEqual(system.other_flasher_running(self.logger), False)
 
+    @patch.object(os.path, "exists", return_value=False)
     @patch.object(system, "open", create=True)
     @patch.object(system, "glob", return_value=["/proc/456/cmdline"])
     @patch.object(os, "getpid", return_value=123)
     def test_other_flasher_running_return_true(
-        self, mocked_getpid, mocked_glob, mocked_open
+        self, mocked_getpid, mocked_glob, mocked_open, mocked_exists
     ):
         read_data = [
             b"python\x00/usr/local/bin/psu-update-delta.py\x00",
@@ -231,18 +375,25 @@ class TestSystem(unittest.TestCase):
             mocked_open.return_value = mock_open(read_data=datum).return_value
             self.assertEqual(system.other_flasher_running(self.logger), True)
 
+    @patch.object(os.path, "exists", return_value=True)
+    def test_other_flasher_running_flashy_exists(self, mocked_exists):
+        self.assertEqual(system.other_flasher_running(self.logger), True)
+
     @patch.object(system, "other_flasher_running", return_value=True)
     @patch.object(subprocess, "check_call")
     def test_flash_while_flashing_refused(
         self, mocked_check_call, mocked_other_flasher_running
     ):
         with self.assertRaises(SystemExit) as context_manager:
-            system.flash(1, self.mock_image, self.mock_mtd, self.logger)
+            system.flash(1, self.mock_image, self.mock_mtd, self.logger, None)
             mocked_check_call.assert_not_called()
             self.assertEqual(context_manager.exception.code, 1)
 
     @patch.object(system, "other_flasher_running", return_value=False)
-    def test_flash_retries(self, mocked_other_flasher_running):
+    @patch.object(system, "image_file_compatible", return_value=True)
+    def test_flash_retries(
+        self, mocked_image_file_compatible, mocked_other_flasher_running
+    ):
         for combination in range(100):
             attempts = combination % 10
             failures = combination // 10
@@ -263,7 +414,9 @@ class TestSystem(unittest.TestCase):
                     )
                     calls.append(flashcp)
                 mocked_check_call.side_effect = return_values
-                system.flash(attempts, self.mock_image, self.mock_mtd, self.logger)
+                system.flash(
+                    attempts, self.mock_image, self.mock_mtd, self.logger, None
+                )
                 self.assertNotEqual(mocked_other_flasher_running.call_count, 0)
                 if attempts == 0:
                     self.assertEqual(mocked_check_call.call_count, 1)

@@ -56,6 +56,7 @@ extern "C" {
  */
 #define GPIO_SHADOW_ROOT	"/tmp/gpionames"
 #define GPIO_CHIP_ASPEED	"aspeed-gpio"
+#define GPIO_CHIP_I2C_IO_EXP	"i2c-io-expander"
 #define GPIO_CHIP_MAX		64
 
 /*
@@ -149,6 +150,17 @@ int gpio_export_by_offset(const char *chip, int offset,
  */
 int gpio_unexport(const char *shadow);
 
+
+/*
+ * Function to check given gpio is exported or not.
+ *
+ * Return:
+ *   true: exported, false: not exported.
+ */
+bool gpio_is_exported(const char * shadow);
+
+
+
 /*
  * Functions to open a gpio pin.
  * Although a gpio pin can be specified by global pin number, we don't
@@ -184,6 +196,46 @@ int gpio_get_direction(gpio_desc_t *gdesc, gpio_direction_t *dir);
 int gpio_set_direction(gpio_desc_t *gdesc, gpio_direction_t dir);
 int gpio_get_edge(gpio_desc_t *gdesc, gpio_edge_t *edge);
 int gpio_set_edge(gpio_desc_t *gdesc, gpio_edge_t edge);
+
+/* Get GPIO value given the shadow name of the gpio-pin.
+ *
+ * Return:
+ * GPIO_VALUE_INVALID on failure,
+ * GPIO_VALUE_LOW/GPIO_VALUE_HIGH on success
+ */
+gpio_value_t gpio_get_value_by_shadow(const char *shadow);
+
+/* Set GPIO value given the shadow name of the gpio-pin.
+ *
+ * Return:
+ *   0 for success, or -1 on failures.
+ */
+int gpio_set_value_by_shadow(const char *shadow, gpio_value_t);
+
+/* Set GPIO init value given the shadow name of the gpio-pin.
+ *
+ * Return:
+ *   0 for success, or -1 on failures.
+ */
+int gpio_set_init_value_by_shadow(const char *shadow, gpio_value_t);
+
+/* Get value of an array of GPIOs given their shadow names
+ * as a bit-mask of their values
+ *
+ * Return:
+ *   0 for success, or -1 on failures.
+ */
+int gpio_get_value_by_shadow_list(const char * const *shadows, size_t num, unsigned int *mask);
+
+
+/* Set value provided as a bitmask of individual GPIO values of an array
+ * of GPIOs given their shadow names.
+ *
+ * Return:
+ * 0 for success, or -1 on failures.
+ */
+int gpio_set_value_by_shadow_list(const char * const *shadows, size_t num, unsigned int mask);
+
 
 /*
  * Sets the gpio pin to output with given initial value atomically.

@@ -41,8 +41,6 @@ IMAGE_INSTALL += " \
   me-util \
   crashdump \
   log-util-v2 \
-  lldp-util \
-  spatula \
   openbmc-utils \
   ipmi-util \
   guid-util \
@@ -59,17 +57,8 @@ IMAGE_INSTALL += " \
   nvme-util \
   snapshot-util \
   slot-util \
-  "
-
-IMAGE_FEATURES += " \
-  ssh-server-openssh \
-  tools-debug \
-  "
-
-DISTRO_FEATURES += " \
-  ext2 \
-  ipv6 \
-  nfs \
-  usbgadget \
-  usbhost \
+  dimm-util \
+  setup-gpio \
+  at \
+  name-util \
   "

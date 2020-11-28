@@ -37,9 +37,14 @@
 /*
  * gpio sysfs paths and files.
  */
+#ifdef __TEST__
+#define GPIO_SYSFS_ROOT			"/tmp/test"
+#else
 #define GPIO_SYSFS_ROOT			"/sys/class/gpio"
-#define GPIO_SYSFS_EXPORT		"/sys/class/gpio/export"
-#define GPIO_SYSFS_UNEXPORT		"/sys/class/gpio/unexport"
+#endif
+#define GPIO_SYSFS_EXPORT		GPIO_SYSFS_ROOT "/export"
+#define GPIO_SYSFS_UNEXPORT		GPIO_SYSFS_ROOT "/unexport"
+#define GPIO_SYSFS_PIN_PATH		GPIO_SYSFS_ROOT "/gpio%d"
 #define GPIO_SYSFS_EDGE_FILE		"edge"
 #define GPIO_SYSFS_VALUE_FILE		"value"
 #define GPIO_SYSFS_DIRECTION_FILE	"direction"
@@ -55,6 +60,11 @@
  * Default buffer size when reading/writing gpio sysfs files.
  */
 #define GPIO_SYSFS_IO_BUF_SIZE		16
+
+/*
+ * Default path size when export gpio sysfs files.
+ */
+#define GPIO_SYSFS_PATH_SIZE		64
 
 /*
  * Aspeed gpio controller's device name in sysfs tree.
@@ -98,6 +108,7 @@ static int gsysfs_export_control(const char *ctrl_file, int pin_num)
 {
 	int fd, count;
 	int status = 0;
+	char pin_path[GPIO_SYSFS_PATH_SIZE];
 	char data[GPIO_SYSFS_IO_BUF_SIZE];
 
 	GLOG_DEBUG("open <%s> for write\n", ctrl_file);
@@ -108,13 +119,16 @@ static int gsysfs_export_control(const char *ctrl_file, int pin_num)
 		return -1;
 	}
 
-	snprintf(data, sizeof(data), "%d", pin_num);
-	count = strlen(data);
-	GLOG_DEBUG("write data (%s) to <%s>\n", data, ctrl_file);
-	if (write(fd, data, count) != count) {
-		GLOG_ERR("failed to write <%s> to <%s>: %s\n",
-			 data, ctrl_file, strerror(errno));
-		status = -1;
+	snprintf(pin_path, sizeof(pin_path), GPIO_SYSFS_PIN_PATH, pin_num);
+	if (access(pin_path, F_OK ) == -1 ) {
+		snprintf(data, sizeof(data), "%d", pin_num);
+		count = strlen(data);
+		GLOG_DEBUG("write data (%s) to <%s>\n", data, ctrl_file);
+		if (write(fd, data, count) != count) {
+			GLOG_ERR("failed to write <%s> to <%s>: %s\n",
+				 data, ctrl_file, strerror(errno));
+			status = -1;
+		}
 	}
 
 	close(fd);
@@ -431,7 +445,7 @@ static char* gsysfs_chip_read_device(char *buf,
 	target_path[len] = '\0';
 
 	base_name = basename(target_path);
-	strncpy(buf, base_name, size);
+	strncpy(buf, base_name, size - 1);
 	return buf;
 }
 
@@ -489,18 +503,18 @@ static void chip_desc_init(gpiochip_desc_t *gcdesc,
 	memset(gcdesc, 0, sizeof(*gcdesc));
 	gcdesc->base = base;
 	gcdesc->ngpio = ngpio;
-	strncpy(gcdesc->dev_name, dev_name, sizeof(gcdesc->dev_name));
+	strncpy(gcdesc->dev_name, dev_name, sizeof(gcdesc->dev_name) - 1);
 
 	/*
 	 * Update "chip_type" and gpiochip_ops.
 	 */
 	if (strcmp(dev_name, GPIO_SYSFS_ASPEED_DEVICE) == 0) {
 		strncpy(gcdesc->chip_type, GPIO_CHIP_ASPEED_SOC,
-			sizeof(gcdesc->chip_type));
+			sizeof(gcdesc->chip_type) - 1);
 		gcdesc->ops = &aspeed_gpiochip_ops;
 	} else if (i2c_sysfs_is_valid_suid(dev_name)) {
 		strncpy(gcdesc->chip_type, GPIO_CHIP_I2C_EXPANDER,
-			sizeof(gcdesc->chip_type));
+			sizeof(gcdesc->chip_type) - 1);
 	}
 }
 

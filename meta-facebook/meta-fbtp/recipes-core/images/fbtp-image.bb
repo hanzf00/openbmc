@@ -33,7 +33,7 @@ IMAGE_INSTALL += " \
   ipmbd \
   me-util \
   ipmb-util \
-  log-util \
+  log-util-v2 \
   kcsd \
   healthd \
   fpc-util \
@@ -53,17 +53,8 @@ IMAGE_INSTALL += " \
   ncsi-util \
   ncsid \
   libpldm \
-  "
-
-IMAGE_FEATURES += " \
-  ssh-server-openssh \
-  tools-debug \
-  "
-
-DISTRO_FEATURES += " \
-  ext2 \
-  ipv6 \
-  nfs \
-  usbgadget \
-  usbhost \
+  obmc-sensors-test \
+  dimm-util \
+  setup-gpio \
+  name-util \
   "

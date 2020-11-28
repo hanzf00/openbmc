@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2018-present Facebook. All Rights Reserved.
 #
@@ -34,11 +34,14 @@ class RestEndpointTest(FbossRestEndpointTest, unittest.TestCase):
     MB_SEUTIL_ENDPOINT = "/api/sys/mb/seutil"
     PIM_INFO_ENDPOINT = "/api/sys/piminfo"
     PIM_SERIAL_ENDPOINT = "/api/sys/pimserial"
+    PIM_STATUS_ENDPOINT = "/api/sys/pimstatus"
     PIM_FIRMWARE_INFO = "/api/sys/firmware_info_pim"
     SCM_FIRMWARE_INFO = "/api/sys/firmware_info_scm"
+    PIM_DETAILS_ENDPOINT = "/api/sys/pimdetails"
     ALL_FIRMWARE_INFO = (
-        "/api/sys/firmware_info_all"
-    )  # duplicate endpoint to firmware_info/all
+        "/api/sys/firmware_info_all"  # duplicate endpoint to firmware_info/all
+    )
+    SYSTEM_LED_INFO = "/api/sys/system_led_info"
 
     # /api/sys
     def set_endpoint_sys_attributes(self):
@@ -58,6 +61,7 @@ class RestEndpointTest(FbossRestEndpointTest, unittest.TestCase):
             "pimserial",
             "server",
             "gpios",
+            "system_led_info",
         ]
 
     # /api/sys/sensors
@@ -142,6 +146,14 @@ class RestEndpointTest(FbossRestEndpointTest, unittest.TestCase):
             self.endpoint_piminfo_attrb,  # same keys as piminfo
         )
 
+    # "/api/sys/pimstatus"
+    def test_endpoint_api_sys_pimstatus(self):
+        self.set_endpoint_pim_presence_attributes()
+        self.verify_endpoint_attributes(
+            RestEndpointTest.PIM_STATUS_ENDPOINT,
+            self.endpoint_pim_presence,  # same keys as pim_present
+        )
+
     # "/api/sys/mb/seutil"
     def set_endpoint_seutil_fruid_attributes(self):
         self.endpoint_seutil_fruid_attrb = self.FRUID_ATTRIBUTES
@@ -216,4 +228,23 @@ class RestEndpointTest(FbossRestEndpointTest, unittest.TestCase):
         self.set_endpoint_firmware_info_all_attributes()
         self.verify_endpoint_attributes(
             RestEndpointTest.ALL_FIRMWARE_INFO, self.endpoint_firmware_info_all_attrb
+        )
+
+    # "/api/sys/system_led_info"
+    def set_endpoint_system_led_info_attributes(self):
+        self.endpoint_system_led_info_attrb = ["sys", "smb", "psu", "fan"]
+
+    # "/api/sys/system_led_info"
+    def test_endpoint_api_sys_system_led_info(self):
+        self.set_endpoint_system_led_info_attributes()
+        self.verify_endpoint_attributes(
+            RestEndpointTest.SYSTEM_LED_INFO, self.endpoint_system_led_info_attrb
+        )
+
+    # "/api/sys/pimdetails"
+    def test_endpoint_api_sys_pimdetails(self):
+        self.set_endpoint_firmware_info_pim_attributes()
+        self.verify_endpoint_attributes(
+            RestEndpointTest.PIM_DETAILS_ENDPOINT,
+            self.endpoint_firmware_info_pim_attributes,
         )

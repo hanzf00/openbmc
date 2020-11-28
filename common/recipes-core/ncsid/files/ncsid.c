@@ -52,13 +52,13 @@
 #include <openbmc/pldm_base.h>
 #include <openbmc/pldm_fw_update.h>
 #include <openbmc/pldm_pmc.h>
-#include <openbmc/obmc-sensor.h>
+#include <openbmc/pal_sensors.h>
 #include <inttypes.h>
 //#define DEBUG 0
 //#define PLDM_SNR_DBG 0
 
 // special  channel/cmd  used for register AEN handler with kernel
-#define REG_AEN_CH  0xfa
+#define REG_AEN_CH  0x1a
 #define REG_AEN_CMD 0xce
 
 #ifndef MAX
@@ -454,7 +454,11 @@ write_pldm_sensor_info()
     goto close_bail;
   }
 
-  ftruncate(fd, share_size);
+  if (ftruncate(fd, share_size) != 0) {
+    syslog(LOG_ERR, "%s: truncate %s failed errno = %d\n",
+        __FUNCTION__, PLDM_SNR_INFO, errno);
+    goto close_bail;
+  }
 
   shm = (char *)mmap(NULL, share_size, PROT_WRITE, MAP_SHARED, fd, 0);
 
@@ -547,7 +551,8 @@ do_pldm_discovery(nl_sfd_t *sfd, NCSI_NL_RSP_T *resp_buf)
   if (pldmStatus == CC_SUCCESS) {
     pldmType = pldmHandleGetPldmTypesResp((PLDM_GetPldmTypes_Response_t *)&(resp_buf->msg_payload[7]));
   }
-  syslog(LOG_CRIT, "PLDM type supported = 0x%" PRIx64, pldmType);
+  syslog(LOG_CRIT, "FRU: %d PLDM type supported = 0x%" PRIx64,
+            pal_get_nic_fru_id(), pldmType);
 
   // Query  version for each supported type
   for (i = 0; i < PLDM_RSV; ++i) {
@@ -568,7 +573,8 @@ do_pldm_discovery(nl_sfd_t *sfd, NCSI_NL_RSP_T *resp_buf)
     if (pldmStatus == CC_SUCCESS) {
       pldmHandleGetVersionResp((PLDM_GetPldmVersion_Response_t *)&(resp_buf->msg_payload[7]),
                                          &pldm_version);
-      syslog(LOG_CRIT, "    PLDM type %d version = %d.%d.%d.%d", i,
+      syslog(LOG_CRIT, "    FRU: %d PLDM type %d version = %d.%d.%d.%d",
+               pal_get_nic_fru_id(), i,
                pldm_version.major, pldm_version.minor, pldm_version.update,
                pldm_version.alpha);
 
@@ -633,15 +639,17 @@ init_nic_config(nl_sfd_t *sfd)
   init_version_data((Get_Version_ID_Response*)(pNcsiResp->Payload_Data));
 
   aen_enable_mask &= gNicCapability.aen_control_support;
-  syslog(LOG_CRIT, "NIC AEN Supported: 0x%x, AEN Enable Mask=0x%x",
-          gNicCapability.aen_control_support, aen_enable_mask);
+  syslog(LOG_CRIT, "FRU: %d NIC AEN Supported: 0x%x, AEN Enable Mask=0x%x",
+          pal_get_nic_fru_id(), gNicCapability.aen_control_support,
+          aen_enable_mask);
 
   // PLDM discovery
   do_pldm_discovery(sfd, resp_buf);
   // PLDM support is optional, so ignore return value for now
 
   if (gEnablePldmMonitoring) {
-    syslog(LOG_CRIT, "    PLDM sensor monitoring enabled");
+    syslog(LOG_CRIT, "    FRU: %d PLDM sensor monitoring enabled",
+            pal_get_nic_fru_id());
   }
 
 
@@ -656,7 +664,8 @@ free_exit:
 static int
 handle_pldm_snr_read(NCSI_Response_Packet *resp)
 {
-  int pldm_iid = 0, pltf_id = 0, sensor_id = 0, sensor_val = 0;
+  int pldm_iid = 0, pltf_id = 0, sensor_id = 0;
+  float sensor_val = 0;
   unsigned char *pPldmResp = 0;
   int nic_fru_id = -1;  // each platform has a different FRU ID defined for NIC
 
@@ -680,14 +689,18 @@ handle_pldm_snr_read(NCSI_Response_Packet *resp)
   // depending on sensor type (numeric vs state), interpret the response
   //  accordingly
   if (pldm_sensors[sensor_id].sensor_type == PLDM_SENSOR_TYPE_NUMERIC) {
-    sensor_val = pldm_get_num_snr_val(
+    sensor_val = (float)pldm_get_num_snr_val(
                    (PLDM_SensorReading_Response_t *) pPldmResp);
   } else if (pldm_sensors[sensor_id].sensor_type == PLDM_SENSOR_TYPE_STATE) {
-    sensor_val = pldm_get_state_snr_val(
+    sensor_val = (float)pldm_get_state_snr_val(
                   (PLDM_StateSensorReading_Response_t *) pPldmResp);
   } else {
     syslog(LOG_WARNING, "%s unknown sensor type, snr 0x%x, type %d",
            __FUNCTION__, pltf_id, pldm_sensors[sensor_id].sensor_type);
+  }
+
+  if (pltf_id == PLDM_NUMERIC_SENSOR_START+2) { // PORT_0_LINK_SPEED
+    sensor_val = (sensor_val * 100) / 1000.0;
   }
 
   // Write the sensor reading to sensor cache
@@ -695,7 +708,7 @@ handle_pldm_snr_read(NCSI_Response_Packet *resp)
   if (nic_fru_id != -1) {
     // IF platform doesn't have a NIC FRU, or hasn't overwrite the obmc-pal lib
     //   don't save this information
-    if (sensor_cache_write(nic_fru_id, pltf_id, true, (float)sensor_val)) {
+    if (sensor_cache_write(nic_fru_id, pltf_id, true, sensor_val)) {
       syslog(LOG_WARNING, "%s sensor cache write failed", __FUNCTION__);
     }
   }
@@ -906,6 +919,8 @@ static int pldm_monitoring(int sock_fd)
               (PLDM_COMMON_REQ_LEN + sizeof(PLDM_Get_StateSensor_Reading_t)),
               (unsigned char *)&(pldmReq.common), 0);
       }
+      if (ret)
+        break; //Prepare_ncsi_req_msg failed as low memory, no reason to continue
       // fill in the look up table, store in the sensor index to IID table
       //  so when we received the PLDM response, we can map the response back
       //  to sensor
@@ -921,7 +936,9 @@ static int pldm_monitoring(int sock_fd)
       syslog(LOG_ERR, "tx: failed to send pldm_msg, status ret = %d, errno=%d\n",
              ret, errno);
     }
+    free_ncsi_req_msg(&pldm_msg);
   }
+
   return ret;
 }
 

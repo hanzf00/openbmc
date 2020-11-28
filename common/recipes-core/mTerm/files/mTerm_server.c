@@ -28,6 +28,8 @@
 
 #define NUM_CLIENTS 10
 
+static size_t file_size = FILE_SIZE_BYTES;
+
 static int createServerSocket(const char* dev) {
   int serverFd;
   struct sockaddr_un local;
@@ -99,33 +101,36 @@ void sendBreak(int clientFd, int solFd, char *c) {
 static void processClient(fd_set* master, int clientFd , int solFd,
                           bufStore *buf) {
   char data[SEND_SIZE];
-  int nbytes = 0;
+  int nbytesHeader = 0, nbytesData = 0;
   TlvHeader header;
-  struct iovec vec[2];
+  struct iovec vecHeader, vecData;
   char* tbuf;
 
-  vec[0].iov_base = &header;
-  vec[0].iov_len = sizeof(header);
-  vec[1].iov_base = &data;
-  vec[1].iov_len = SEND_SIZE;
-
   /* TODO: server should be able to handle data for a tlv over multiple reads */
-  nbytes = readv(clientFd, vec, 2);
+  /* Reading header from client FD */
+  vecHeader.iov_base = &header;
+  vecHeader.iov_len = sizeof(header);
+  nbytesHeader = readv(clientFd, &vecHeader, 1);
+  /* Reading client data to which header length info correspond */
+  vecData.iov_base = &data;
+  vecData.iov_len = header.length;
+  nbytesData = readv(clientFd, &vecData, 1);
 
-  if (nbytes <= 0) {
-    if (nbytes == 0) {
+  if (nbytesHeader <= 0) {
+    if (nbytesHeader == 0) {
       syslog(LOG_ERR, "mTerm_server: Client socket %d hung up\n", clientFd);
     } else {
       syslog(LOG_ERR, "mTerm_server: Error on read fd=%d\n", clientFd);
     }
     closeClient(master, clientFd);
-  } else if (nbytes < sizeof(TlvHeader)) {
+  } else if (nbytesHeader < sizeof(TlvHeader)) {
     // TODO: Potentially we should use a per-client buffer, for now close
     //  Client connection
-    syslog(LOG_ERR, "mTerm_server: Error on read fd=%d socket_nbytes=%d\n", clientFd, nbytes);
+    syslog(LOG_ERR, "mTerm_server: Error on read fd=%d socket_nbytes=%d\n", clientFd, nbytesHeader);
     closeClient(master, clientFd);
-  } else if (header.length > (nbytes - sizeof(header))) {
-    syslog(LOG_ERR, "mTerm_server: Received %d bytes for fd=%d dropping message.\n",nbytes, clientFd);
+  } else if (header.length != nbytesData ) {
+    syslog(LOG_ERR,"mTerm_server: data is not correct to receive nbytes=%d, length=%d",nbytesData, header.length);
+    //syslog(LOG_ERR, "mTerm_server: Received %d bytes for fd=%d dropping message.\n",nbytes, clientFd);
   } else {
     switch (header.type) {
       case ASCII_CTRL_L:
@@ -133,7 +138,7 @@ static void processClient(fd_set* master, int clientFd , int solFd,
          buffer read per client, thus subsequent reads can be based on the
          last reference
         */
-        tbuf = vec[1].iov_base;
+        tbuf = vecData.iov_base;
         if (isalpha(*tbuf)) {
           if (*tbuf == 'b') {
             sendBreak(clientFd, solFd, tbuf);
@@ -141,7 +146,7 @@ static void processClient(fd_set* master, int clientFd , int solFd,
             syslog(LOG_ERR, "mTerm_server: Received incorrect break char");
           }
         } else {
-          bufferGetLines(buf->file, clientFd, atoi(vec[1].iov_base), 0);
+          bufferGetLines(buf->file, clientFd, atoi(vecData.iov_base), 0);
         }
         break;
       case 'x':
@@ -149,7 +154,7 @@ static void processClient(fd_set* master, int clientFd , int solFd,
         closeClient(master, clientFd);
         break;
       case ASCII_CARAT:
-        writeData(solFd, vec[1].iov_base, header.length, "tty");
+        writeData(solFd, vecData.iov_base, nbytesData, "tty");
         break;
       default:
         syslog(LOG_ERR, "mTerm_server: Received unknown tlv\n");
@@ -212,7 +217,7 @@ static void connectServer(const char *stty, const char *dev) {
   }
 
   struct bufStore* buf;
-  buf = createBuffer(dev, FILE_SIZE_BYTES);
+  buf = createBuffer(dev, file_size);
   if (!buf || (buf->buf_fd < 0)) {
     syslog(LOG_ERR, "mTerm_server: Failed to create the log file\n");
     closeTty(tty_sol);
@@ -264,11 +269,15 @@ static void connectServer(const char *stty, const char *dev) {
 
 static void
 print_usage() {
-  printf("Usage example: /usr/local/bin/mTerm_server <fru> /dev/ttyS*\n");
+  printf("Usage:\t/usr/local/bin/mTerm_server <fru> /dev/ttyS*\n"
+      "\t/usr/local/bin/mTerm_server <fru> /dev/ttyS* baudrate\n"
+      "\t/usr/local/bin/mTerm_server <fru> /dev/ttyS* baudrate max-log-size\n\n"
+      "\tDefault baudrate: 57600\n"
+      "\tDefault max log size: 300 KB\n");
 }
 
 int main(int argc, char **argv) {
-  if (argc != 3) {
+  if (argc < 3 || argc > 5) {
     print_usage();
     exit(1);
   }
@@ -276,6 +285,22 @@ int main(int argc, char **argv) {
   char *stty, *dev;
   dev = argv[1];
   stty = argv[2];
+  baudrate = BAUDRATE;
+  file_size = FILE_SIZE_BYTES;
+
+  if (argc >= 4) {
+    baudrate = strtol(argv[3], NULL, 10);
+    if (errno)
+      baudrate = BAUDRATE;
+  }
+
+  if (argc == 5) {
+    file_size = strtol(argv[4], NULL, 10);
+    if (errno || file_size < FILE_SIZE_BYTES || file_size > FILE_SIZE_MAX_BYTES) {
+      printf("File size must be between %d and %d bytes\n", FILE_SIZE_BYTES, FILE_SIZE_MAX_BYTES);
+      exit(-1);
+    }
+  }
 
   int ret;
   char file[PATH_SIZE];

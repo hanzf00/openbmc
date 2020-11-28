@@ -24,6 +24,7 @@ extern "C" {
 
 #include <stdint.h>
 
+#define FBW_EEPROM_PATH_SIZE 200
 #define FBW_EEPROM_F_MAGIC 2
 #define FBW_EEPROM_F_VERSION 1
 #define FBW_EEPROM_F_PRODUCT_NAME 12
@@ -66,7 +67,7 @@ struct wedge_eeprom_st {
   /* Top Level 20 - Product Part Number: XX-XXXXXX */
   char fbw_product_number[FBW_EEPROM_F_PRODUCT_NUMBER + 2];
 
-  /* System Assembly Part Number XXX-XXXXXX-XX */
+  /* System Assembly Part Number XX-XXXXXXX-XX */
   char fbw_assembly_number[FBW_EEPROM_F_ASSEMBLY_NUMBER + 3];
 
   /* Facebook PCBA Part Number: XXX-XXXXXXX-XX */
@@ -131,6 +132,8 @@ struct wedge_eeprom_st {
 };
 
 int wedge_eeprom_parse(const char *fn, struct wedge_eeprom_st *eeprom);
+
+void wedge_eeprom_path(char *eeprom_path);
 
 #ifdef __cplusplus
 }

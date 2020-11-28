@@ -17,45 +17,83 @@
 # 51 Franklin Street, Fifth Floor,
 # Boston, MA 02110-1301 USA
 #
-from ctypes import *
+from ctypes import CDLL, c_char_p
 from re import match
 from subprocess import PIPE, Popen
 
 from fsc_util import Logger
 
+import libgpio
 
-lpal_hndl = CDLL("libpal.so")
+lpal_hndl = CDLL("libpal.so.0")
 
-fru_map = {
-    "slot1": {
-        "name": "fru1",
-        "pwr_gpio": "64",
-        "bic_ready_gpio": "106",
-        "slot_num": 1,
-        "slot_12v_status": "116",
-    },
-    "slot2": {
-        "name": "fru2",
-        "pwr_gpio": "65",
-        "bic_ready_gpio": "107",
-        "slot_num": 2,
-        "slot_12v_status": "117",
-    },
-    "slot3": {
-        "name": "fru3",
-        "pwr_gpio": "66",
-        "bic_ready_gpio": "108",
-        "slot_num": 3,
-        "slot_12v_status": "118",
-    },
-    "slot4": {
-        "name": "fru4",
-        "pwr_gpio": "67",
-        "bic_ready_gpio": "109",
-        "slot_num": 4,
-        "slot_12v_status": "119",
-    },
-}
+# check kernel version
+ver = Popen('uname -r', shell=True, stdout=PIPE).stdout.read()
+ver = ver.decode()
+if ver[0] == '5':
+    gpio_path = "/tmp/gpionames/"
+    fru_map = {
+        "slot1": {
+            "name": "fru1",
+            "pwr_gpio": "SLOT1_POWER_EN",
+            "bic_ready_gpio": "I2C_SLOT1_ALERT_N",
+            "slot_num": 1,
+            "slot_12v_status": "P12V_STBY_SLOT1_EN",
+        },
+        "slot2": {
+            "name": "fru2",
+            "pwr_gpio": "SLOT2_POWER_EN",
+            "bic_ready_gpio": "I2C_SLOT2_ALERT_N",
+            "slot_num": 2,
+            "slot_12v_status": "P12V_STBY_SLOT2_EN",
+        },
+        "slot3": {
+            "name": "fru3",
+            "pwr_gpio": "SLOT3_POWER_EN",
+            "bic_ready_gpio": "I2C_SLOT3_ALERT_N",
+            "slot_num": 3,
+            "slot_12v_status": "P12V_STBY_SLOT3_EN",
+        },
+        "slot4": {
+            "name": "fru4",
+            "pwr_gpio": "SLOT4_POWER_EN",
+            "bic_ready_gpio": "I2C_SLOT4_ALERT_N",
+            "slot_num": 4,
+            "slot_12v_status": "P12V_STBY_SLOT4_EN",
+        },
+    }
+else:
+    gpio_path = "/sys/class/gpio/gpio"
+    fru_map = {
+        "slot1": {
+            "name": "fru1",
+            "pwr_gpio": "64",
+            "bic_ready_gpio": "106",
+            "slot_num": 1,
+            "slot_12v_status": "116",
+        },
+        "slot2": {
+            "name": "fru2",
+            "pwr_gpio": "65",
+            "bic_ready_gpio": "107",
+            "slot_num": 2,
+            "slot_12v_status": "117",
+        },
+        "slot3": {
+            "name": "fru3",
+            "pwr_gpio": "66",
+            "bic_ready_gpio": "108",
+            "slot_num": 3,
+            "slot_12v_status": "118",
+        },
+        "slot4": {
+            "name": "fru4",
+            "pwr_gpio": "67",
+            "bic_ready_gpio": "109",
+            "slot_num": 4,
+            "slot_12v_status": "119",
+        },
+    }
 
 loc_map = {
     "a0": "_dimm0_location",
@@ -83,12 +121,10 @@ loc_map_ep = {
 }
 
 loc_map_nd = {
-    "a": "_dimm0_location",
-    "c": "_dimm1_location",
-    "d": "_dimm2_location",
-    "e": "_dimm3_location",
-    "g": "_dimm4_location",
-    "h": "_dimm5_location",
+    "c": "_dimm0_location",
+    "d": "_dimm1_location",
+    "g": "_dimm2_location",
+    "h": "_dimm3_location",
 }
 
 
@@ -144,16 +180,10 @@ def set_all_pwm(boost):
 
 
 def rc_stby_sensor_check(board):
-    with open(
-        "/sys/class/gpio/gpio" + fru_map[board]["slot_12v_status"] + "/value", "r"
-    ) as f:
-        slot_12v_sts = f.read(1)
-    if slot_12v_sts[0] == "1":
-        with open(
-            "/sys/class/gpio/gpio" + fru_map[board]["bic_ready_gpio"] + "/value", "r"
-        ) as f:
-            bic_rdy = f.read(1)
-        if bic_rdy[0] == "0":
+    f = libgpio.GPIO(shadow=fru_map[board]["slot_12v_status"])
+    if f.get_value() == libgpio.GPIOValue.HIGH:
+        f = libgpio.GPIO(shadow=fru_map[board]["bic_ready_gpio"])
+        if f.get_value() == libgpio.GPIOValue.LOW:
             return 1
         else:
             return 0
@@ -164,6 +194,19 @@ def rc_stby_sensor_check(board):
 fscd_counter = 0
 board_for_counter = ""
 sname_for_counter = ""
+
+
+def all_slots_power_off():
+    all_power_off = True
+    for board in fru_map:
+        with open(
+            gpio_path + fru_map[board]["pwr_gpio"] + "/value", "r"
+        ) as f:
+            pwr_sts = f.read(1)
+        if pwr_sts[0] == "1":
+            all_power_off = False
+            break
+    return all_power_off
 
 
 def sensor_valid_check(board, sname, check_name, attribute):
@@ -182,13 +225,19 @@ def sensor_valid_check(board, sname, check_name, attribute):
             fscd_counter = fscd_counter + 1
             lpal_hndl.pal_set_fscd_counter(fscd_counter)
 
-    if match(r"soc_temp_diode", sname) != None:
+    if str(board) == "all":
+        sdata = sname.split("_")
+        board = sdata[0]
+        sname = sname.replace(board + "_", "")
+    Logger.debug("board=%s sname=%s" % (board, sname))
+
+    if match(r"soc_temp_diode", sname) is not None:
         return rc_stby_sensor_check(board)
 
     try:
         if attribute["type"] == "power_status":
             with open(
-                "/sys/class/gpio/gpio" + fru_map[board]["pwr_gpio"] + "/value", "r"
+                gpio_path + fru_map[board]["pwr_gpio"] + "/value", "r"
             ) as f:
                 pwr_sts = f.read(1)
             if pwr_sts[0] == "1":
@@ -196,14 +245,14 @@ def sensor_valid_check(board, sname, check_name, attribute):
                 is_slot_server = lpal_hndl.pal_is_slot_support_update(slot_id)
                 if int(is_slot_server) == 1:
                     with open(
-                        "/sys/class/gpio/gpio"
+                        gpio_path
                         + fru_map[board]["bic_ready_gpio"]
                         + "/value",
                         "r",
                     ) as f:
                         bic_sts = f.read(1)
                     if bic_sts[0] == "0":
-                        if match(r"soc_dimm", sname) != None:
+                        if match(r"soc_dimm", sname) is not None:
                             server_type = lpal_hndl.pal_get_server_type(slot_id)
                             if int(server_type) == 1:  # RC Server
                                 # check DIMM present
@@ -263,7 +312,7 @@ def sensor_valid_check(board, sname, check_name, attribute):
                             is_m2_prsnt = lpal_hndl.pal_is_m2_prsnt(fru_name, snr_name)
                             return int(is_m2_prsnt)
                 else:
-                    if match(r"dc_nvme", sname) != None:  # GPv1
+                    if match(r"dc_nvme", sname) is not None:  # GPv1
                         fru_name = c_char_p(board.encode("utf-8"))
                         snr_name = c_char_p(sname.encode("utf-8"))
                         is_m2_prsnt = lpal_hndl.pal_is_m2_prsnt(fru_name, snr_name)

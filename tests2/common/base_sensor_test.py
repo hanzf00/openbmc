@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2018-present Facebook. All Rights Reserved.
 #
@@ -18,6 +18,7 @@
 # Boston, MA 02110-1301 USA
 #
 import re
+import json
 from abc import abstractmethod
 
 from utils.cit_logger import Logger
@@ -87,7 +88,9 @@ class SensorUtilTest(BaseSensorsTest):
     def parse_sensors(self):
         self.set_sensors_cmd()
         data = run_shell_cmd(self.sensors_cmd)
-        result = {}
+        if "not present" in data:
+            return {"present": False}
+        result = {"present": True}
         # VCCGBE VR Vol                (0x54) :    1.05 Volts | (ok)
         # SOC DIMMA1 Temp              (0xB5) : NA | (na)
         name_regex = re.compile(r"^(.+)\s+\(0x.+\)\s*")
@@ -109,4 +112,14 @@ class SensorUtilTest(BaseSensorsTest):
                 #     sensor_units = value_units[1].strip()
             except Exception:
                 Logger.error("Cannot parse: {}".format(edata))
+        return result
+
+    def get_json_threshold_result(self):
+        self.set_sensors_cmd()
+        self.sensors_cmd[0] += " --json --threshold"
+        data = run_shell_cmd(self.sensors_cmd)
+        if "not present" in data:
+            return {"present": False}
+        result = {"present": True}
+        result.update(json.loads(data))
         return result

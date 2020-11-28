@@ -223,8 +223,12 @@ static gpio_desc_t* gpio_desc_alloc(int pin_num, const char *shadow_path)
 	memset(gdesc, 0, sizeof(*gdesc));
 	gdesc->pin_num = pin_num;
 	if (shadow_path != NULL)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
 		strncpy(gdesc->shadow_path, shadow_path,
-			sizeof(gdesc->shadow_path));
+			sizeof(gdesc->shadow_path) - 1);
+#pragma GCC diagnostic pop
 	return gdesc;
 }
 
@@ -320,6 +324,14 @@ int gpio_unexport(const char *shadow)
 	}
 
 	return GPIO_OPS()->unexport_pin(pin_num, shadow_path);
+}
+
+bool gpio_is_exported(const char * shadow)
+{
+	char path[64] = {0};
+
+	snprintf(path, sizeof(path), "%s/%s", GPIO_SHADOW_ROOT, shadow);
+	return (access(path, F_OK) == 0);
 }
 
 /*
@@ -501,6 +513,47 @@ int gpio_set_init_value(gpio_desc_t *gdesc, gpio_value_t value)
 	return GPIO_OPS()->set_pin_init_value(gdesc, value);
 }
 
+gpio_value_t gpio_get_value_by_shadow(const char *shadow)
+{
+  gpio_value_t value = GPIO_VALUE_INVALID;
+  gpio_desc_t *desc = gpio_open_by_shadow(shadow);
+  if (!desc) {
+    return GPIO_VALUE_INVALID;
+  }
+  if (gpio_get_value(desc, &value)) {
+    value = GPIO_VALUE_INVALID;
+  }
+  gpio_close(desc);
+  return value;
+}
+
+int gpio_set_value_by_shadow(const char *shadow, gpio_value_t value)
+{
+  gpio_desc_t *desc = gpio_open_by_shadow(shadow);
+  if (!desc) {
+    return -1;
+  }
+  if (gpio_set_value(desc, value)) {
+    return -1;
+  }
+  gpio_close(desc);
+  return 0;
+}
+
+int gpio_set_init_value_by_shadow(const char *shadow, gpio_value_t value)
+{
+	gpio_desc_t *desc = gpio_open_by_shadow(shadow);
+	if (!desc) {
+		return -1;
+	}
+	if (gpio_set_init_value(desc, value)) {
+		gpio_close(desc);
+		return -1;
+	}
+	gpio_close(desc);
+	return 0;
+}
+
 gpiopoll_desc_t* gpio_poll_open(struct gpiopoll_config *config,
 				size_t num_config)
 {
@@ -674,4 +727,41 @@ gpio_desc_t *gpio_poll_get_descriptor(gpiopoll_pin_t *gpdesc)
 		return NULL;
 	}
 	return gpdesc->gpio;
+}
+
+int gpio_get_value_by_shadow_list(const char *const *shadows, size_t num, unsigned int *mask)
+{
+  size_t i;
+
+  if (num > sizeof(*mask) * 8 || !shadows || !mask) {
+    errno = EINVAL;
+    return -1;
+  }
+  *mask = 0;
+
+  for (i = 0; i < num; i++) {
+    gpio_value_t value = gpio_get_value_by_shadow(shadows[i]);
+    if (value == GPIO_VALUE_INVALID) {
+      return -1;
+    }
+    *mask |= (value == GPIO_VALUE_HIGH ? 1 : 0) << i;
+  }
+  return 0;
+}
+
+int gpio_set_value_by_shadow_list(const char *const *shadows, size_t num, unsigned int mask)
+{
+  size_t i;
+
+  if (num > sizeof(mask) * 8 || !shadows) {
+    errno = EINVAL;
+    return -1;
+  }
+  for (i = 0; i < num; i++) {
+    gpio_value_t value = (mask & (1 << i)) ? GPIO_VALUE_HIGH : GPIO_VALUE_LOW;
+    if (gpio_set_value_by_shadow(shadows[i], value)) {
+      return -1;
+    }
+  }
+  return 0;
 }

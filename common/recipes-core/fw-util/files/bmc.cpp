@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <sys/mman.h>
 #include <syslog.h>
-#include "bmc.h"
+#include <openbmc/pal.h>
+#include "pfr_bmc.h"
 
 using namespace std;
 
 #define BMC_RW_OFFSET               (64 * 1024)
 #define ROMX_SIZE                   (84 * 1024)
+#define META_SIZE                   (64 * 1024)
 
 int BmcComponent::update(string image_path)
 {
@@ -27,7 +29,7 @@ int BmcComponent::update(string image_path)
     return FW_STATUS_NOT_SUPPORTED;
   }
 
-  if (is_valid(image_path) == false) {
+  if (is_valid(image_path, false) == false) {
     system.error << image_path << " is not a valid BMC image for " << system.name() << endl;
     return FW_STATUS_FAILURE;
   }
@@ -80,11 +82,16 @@ int BmcComponent::update(string image_path)
         r_b = read(fd_d, buf, to_copy);
         if (r_b != to_copy) {
           close(fd_r);
-          close(fd_d);
+          close(fd_w);
           close(fd_d);
           return FW_STATUS_FAILURE;
         }
-        write(fd_w, buf, to_copy);
+        if (write(fd_w, buf, to_copy) != (int)to_copy) {
+          close(fd_r);
+          close(fd_w);
+          close(fd_d);
+          return FW_STATUS_FAILURE;
+        }
         copy -= to_copy;
       }
       close(fd_d);
@@ -92,7 +99,11 @@ int BmcComponent::update(string image_path)
 
     // Copy from r to w.
     while ((r_b = read(fd_r, buf, 1024)) > 0) {
-      write(fd_w, buf, r_b);
+      if (write(fd_w, buf, r_b) != (int)r_b) {
+        close(fd_r);
+        close(fd_w);
+        return -1;
+      }
     }
     close(fd_r);
     close(fd_w);
@@ -116,6 +127,36 @@ std::string BmcComponent::get_bmc_version()
 {
   std::string bmc_ver = "NA";
   std::string mtd;
+
+  if ((_vers_mtd == "u-bootro" && system.get_mtd_name(string("metaro"), mtd)) ||
+      (_vers_mtd == "u-boot" && system.get_mtd_name(string("meta"), mtd))) {
+    FILE *fp = NULL;
+    char *line = NULL;
+    do {
+      if (!(fp = fopen(mtd.c_str(), "r")))
+        break;
+
+      if (!(line = (char *)malloc(META_SIZE)))
+        break;
+
+      if (fgets(line, META_SIZE, fp)) {
+        try {
+          json meta = json::parse(string(line));
+          bmc_ver = meta["version_infos"]["fw_ver"];
+        } catch (json::exception& e) {
+          syslog(LOG_ERR, "%s", e.what());
+        }
+      }
+    } while (0);
+    if (fp)
+      fclose(fp);
+    if (line)
+      free(line);
+
+    if (bmc_ver != "NA")
+      return bmc_ver;
+  }
+
   if (!system.get_mtd_name(_vers_mtd, mtd)) {
     return bmc_ver;
   }
@@ -130,14 +171,15 @@ std::string BmcComponent::get_bmc_version(const std::string &mtd)
   FILE *fp;
 
   snprintf(cmd, sizeof(cmd),
-      "strings %s | grep -E 'U-Boot 20[[:digit:]]{2}\\.[[:digit:]]{2}'", mtd.c_str());
+      "dd if=%s bs=64k count=6 2>/dev/null | strings | grep -E 'U-Boot (SPL ){,}20[[:digit:]]{2}\\.[[:digit:]]{2}'",
+      mtd.c_str());
   fp = popen(cmd, "r");
   if (fp) {
     char line[256];
     char *ver = 0;
     while (fgets(line, sizeof(line), fp)) {
       int ret;
-      ret = sscanf(line, "U-Boot 20%*2d.%*2d%*[ ]%m[^ \n]%*[ ](%*[^)])\n", &ver);
+      ret = sscanf(line, "U-Boot%*[^2]20%*2d.%*2d%*[ ]%m[^ \n]%*[ ](%*[^)])\n", &ver);
       if (1 == ret) {
         bmc_ver = ver;
         break;
@@ -166,6 +208,14 @@ int BmcComponent::print_version()
 
   system.output << comp << " Version: " << get_bmc_version() << endl;
   return FW_STATUS_SUCCESS;
+}
+
+void BmcComponent::get_version(json& j) {
+  if (_vers_mtd == "") {
+    j["VERSION"] = system.version();
+  } else {
+    j["VERSION"] = get_bmc_version();
+  }
 }
 
 class SystemConfig {
@@ -206,7 +256,12 @@ class SystemConfig {
       // Verified boot supported and in dual-flash mode.
     } else {
       // We just have the one flash. Allow upgrading flash0.
-      static BmcComponent bmc("bmc", "bmc", system, "flash0");
+      if (pal_is_pfr_active() == PFR_ACTIVE) {
+        static PfrBmcComponent bmc("bmc", "bmc", "stg-bmc");
+        static PfrBmcComponent bmc_rc("bmc", "bmc_rc", "stg-bmc", "rc");
+      } else {
+        static BmcComponent bmc("bmc", "bmc", system, "flash0");
+      }
     }
   }
 };

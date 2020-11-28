@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2018-present Facebook. All Rights Reserved.
 #
@@ -19,6 +19,7 @@
 #
 import json
 import os
+import re
 from abc import abstractmethod
 
 from utils.cit_logger import Logger
@@ -32,6 +33,22 @@ except ImportError:
     # Fall back to Python 2's urllib2
     from urllib2 import urlopen
     from urllib2 import HTTPError
+
+# Some endpoints may respond with a code != 200 on tests environments
+ALLOWED_NON_OK_RESPONSES = {
+    re.compile("^/api/(sys|spb|iom|sled/mb)/fscd_sensor_data$"): {
+        405  # This endpoint is POST only
+    },
+    re.compile("^/api/(sys|spb|iom|sled/mb)/ntp$"): {
+        # 404 response from this endpoint is normal in lab environments
+        # (as ntp servers may not be available in all lab environments)
+        404,
+    },
+}
+
+
+class BaseRestEndpointException(Exception):
+    pass
 
 
 class BaseRestEndpointTest(object):
@@ -51,20 +68,21 @@ class BaseRestEndpointTest(object):
 
     def get_from_endpoint(self, endpointname=None):
         self.assertNotEqual(endpointname, None, "Endpoint name not set")
-        cmd = BaseRestEndpointTest.CURL_CMD6.format(endpointname)
-        Logger.info("Executing cmd={}".format(cmd))
+        endpoint = BaseRestEndpointTest.CURL_CMD6.format(endpointname)
+        Logger.info("Requesting GET {endpoint}".format(endpoint=endpoint))
         try:
             # Send request to REST service to see if it's alive
-            handle = urlopen(cmd)
+            handle = urlopen(endpoint)
             data = handle.read()
             Logger.info("REST request returned data={}".format(data.decode("utf-8")))
             return data.decode("utf-8")
         except Exception as ex:
-            raise (
-                "Failed to perform REST request for cmd={}, Exception={}".format(
-                    cmd, ex
+            raise BaseRestEndpointException(
+                "Failed to request GET {endpoint}, Exception={ex}".format(
+                    endpoint=endpoint,
+                    ex=repr(ex),
                 )
-            )
+            ) from None
 
     def test_server_httperror_code_404(self):
         """
@@ -84,8 +102,27 @@ class BaseRestEndpointTest(object):
             with self.subTest(item=item):
                 new_endpoint = endpointname + "/" + item
                 cmd = BaseRestEndpointTest.CURL_CMD6.format(new_endpoint)
-                handle = urlopen(cmd)
-                self.assertIn(handle.getcode(), [200, 202])
+                try:
+                    handle = urlopen(cmd)
+
+                except HTTPError as err:
+                    if not self._is_allowed_non_ok(
+                        http_code=err.code, endpoint=new_endpoint
+                    ):
+                        raise BaseRestEndpointException(
+                            "HTTPError on GET {new_endpoint} : {err}".format(
+                                new_endpoint=new_endpoint, err=repr(err)
+                            )
+                        ) from None
+
+                else:
+                    self.assertIn(handle.getcode(), [200, 202])
+
+    def _is_allowed_non_ok(self, http_code, endpoint):
+        for re_endpoint, allowed_codes in ALLOWED_NON_OK_RESPONSES.items():
+            if re_endpoint.match(endpoint) and http_code in allowed_codes:
+                return True
+        return False
 
     def verify_endpoint_attributes(self, endpointname, attributes):
         """

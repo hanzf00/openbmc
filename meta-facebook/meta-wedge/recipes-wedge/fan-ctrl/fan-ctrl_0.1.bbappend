@@ -15,25 +15,27 @@
 # 51 Franklin Street, Fifth Floor,
 # Boston, MA 02110-1301 USA
 
-DEPENDS_append = "libwedge-eeprom update-rc.d-native libwatchdog"
-RDEPENDS_${PN} += "libwedge-eeprom libwatchdog"
+DEPENDS_append = "libwedge-eeprom update-rc.d-native libwatchdog libgpio-ctrl libmisc-utils libobmc-i2c"
+RDEPENDS_${PN} += "libwedge-eeprom libwatchdog libgpio-ctrl libmisc-utils libobmc-i2c"
 
 FILESEXTRAPATHS_prepend := "${THISDIR}/${PN}:"
 SRC_URI += "file://get_fan_speed.sh \
             file://init_pwm.sh \
+            file://pwm_common.sh \
             file://set_fan_speed.sh \
             file://setup-fan.sh \
+            file://fand.cpp \
            "
 
 S = "${WORKDIR}"
 
 binfiles += "get_fan_speed.sh \
             init_pwm.sh \
+            pwm_common.sh \
             set_fan_speed.sh \
            "
 
-LDFLAGS_append = " -lwedge_eeprom -lwatchdog"
-CXXFLAGS_prepend = "-DCONFIG_WEDGE "
+LDFLAGS_append = " -lwedge_eeprom -lwatchdog -lgpio-ctrl -lmisc-utils -lobmc-i2c"
 
 pkgdir = "fan_ctrl"
 

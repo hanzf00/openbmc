@@ -19,11 +19,22 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/files:"
 
 SRC_URI += "file://mcu_fw.h \
             file://mcu_fw.cpp \
+            file://usbdbg.h \
+            file://usbdbg.cpp \
             file://cm.cpp \
+            file://bios.h \
+            file://bios.cpp \
+            file://platform.cpp \
+            file://cpld.cpp \
+            file://me.cpp \
+            file://vr_fw.cpp \
+            file://vr_fw.h \
+            file://nic_ext.h \
+            file://nic_ext.cpp \
            "
 
 SRC_URI_remove = "file://fscd.cpp"
 
-DEPENDS += "libmcu"
-RDEPENDS_${PN} += "libmcu"
-LDFLAGS += "-lmcu"
+DEPENDS += "libmcu libnm libpal libfpga libast-jtag libvr libncsi libnl-wrapper libkv libobmc-i2c"
+RDEPENDS_${PN} += "libmcu libnm libpal libfpga libast-jtag libvr libnl-wrapper libkv libobmc-i2c"
+LDFLAGS += "-lmcu -lnm -lpal -lfpga -last-jtag -lvr -lnl-wrapper -lkv -lobmc-i2c"

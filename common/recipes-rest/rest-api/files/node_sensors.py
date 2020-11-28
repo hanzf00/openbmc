@@ -219,8 +219,11 @@ class sensorsNode(node):
         snr = ''
         if 'name' in param:
             snr_name = param['name']
-        if 'id' in info:
-            snr = info['id']
+        if 'id' in param:
+            snr = param['id']
+        if not self.actions:
+            print("BAIL EARLY")
+            return {"result": "failure"}
         return sensor_util_history_clear(self.name, snr, snr_name)
 
 

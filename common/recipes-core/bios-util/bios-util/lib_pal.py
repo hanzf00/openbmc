@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 import sys
-from ctypes import *
+from ctypes import CDLL, byref, c_ubyte, c_uint
 
 
-libpal_name = "libpal.so"
+libpal_name = "libpal.so.0"
 
 
 def pal_print_postcode(fru):
     postcodes = (c_ubyte * 256)()
-    plen = c_ushort(0)
+    plen = c_uint(0)
     ret = CDLL(libpal_name).pal_get_80port_record(
-        fru, 0, 0, byref(postcodes), byref(plen)
+        fru, byref(postcodes), 256, byref(plen)
     )
     if ret != 0:
         print("Error %d returned by get_80port" % (ret))

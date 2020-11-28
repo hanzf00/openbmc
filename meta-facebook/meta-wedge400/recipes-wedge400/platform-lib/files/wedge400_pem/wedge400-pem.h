@@ -39,12 +39,44 @@ extern "C" {
 
 #define msleep(n) usleep(n*1000)
 
-#define PEM1_EEPROM  "/sys/bus/i2c/devices/22-0050/eeprom"
-#define PEM2_EEPROM  "/sys/bus/i2c/devices/23-0050/eeprom"
+#define PEM1_EEPROM  "/sys/bus/i2c/devices/24-0050/eeprom"
+#define PEM2_EEPROM  "/sys/bus/i2c/devices/25-0050/eeprom"
+/* define for DELTA PEM */
+#define DELTA_MODEL         "ECD24020003"
+#define DELTA_HDR_LENGTH    32
+#define UNLOCK_UPGRADE      0xf0
+#define BOOT_FLAG           0xf1
+#define DATA_TO_RAM         0xf2
+#define DATA_TO_FLASH       0xf3
+#define CRC_CHECK           0xf4
+
+#define FW_IDENTICAL        1
+
+#define NORMAL_MODE         0x00
+#define BOOT_MODE           0x01
+
+#define DELTA_PRI_NUM_OF_BLOCK    32
+#define DELTA_PRI_NUM_OF_PAGE     44
+#define DELTA_PRI_PAGE_START      16
+#define DELTA_PRI_PAGE_END        59
+#define DELTA_SEC_NUM_OF_BLOCK    32
+#define DELTA_SEC_NUM_OF_PAGE     92
+#define DELTA_SEC_PAGE_START      36
+#define DELTA_SEC_PAGE_END        127
+/* end */
 
 #define PEM_BLACKBOX(num, chip) "/mnt/data/pem/pem"#num"_"#chip
 #define PEM_LTC4282_REG_CNT 0x50
 #define PEM_MAX6615_REG_CNT 0x20
+#define PEM_ARCHIVE_BUFF ( PEM_LTC4282_REG_CNT > PEM_MAX6615_REG_CNT ? \
+                          PEM_LTC4282_REG_CNT : PEM_MAX6615_REG_CNT )
+
+/* max6615 sensors registers addr */
+#define MAX6615_REG_TEMP(ch)                (0x00 + (ch))
+#define MAX6615_REG_TEMP_EXT(ch)            (0x1E + (ch))
+#define MAX6615_REG_FAN_CNT(ch)             (0x18 + (ch))
+#define MAX6615_REG_TARGT_PWM(ch)           (0x0B + (ch))
+#define MAX6615_REG_INSTANTANEOUS_PWM(ch)   (0x0D + (ch))
 
 enum pem_chip_t {
   LTC4282,
@@ -61,6 +93,11 @@ typedef struct _i2c_info_t {
   const char *file_path[PEM_CHIP_CNT];
 } i2c_info_t;
 
+typedef struct _pmbus_info_t {
+  const char *item;
+  uint8_t reg;
+} pmbus_info_t;
+
 typedef struct _smbus_info_t {
   const char *item;
   uint8_t reg;
@@ -70,6 +107,16 @@ typedef struct _smbus_info_t {
 enum {
   READ,
   WRITE
+};
+
+enum {
+  STOP,
+  START
+};
+
+enum {
+  DELTA_PEM,
+  UNKNOWN
 };
 
 enum register_t{
@@ -125,6 +172,12 @@ enum register_t{
   POWER_MIN,
   POWER_MAX,
   EE_SCRATCH,
+
+  APP_FW_MAJOR,
+  APP_FW_MINOR,
+  BL_FW_MAJOR,
+  BL_FW_MINOR,
+
   REG_NUM,
 };
 
@@ -278,6 +331,13 @@ typedef struct _pem_status_regs_t {
   pem_status_t status;
 } pem_status_regs_t;
 
+typedef struct _pem_firmware_regs_t {
+  uint8_t app_fw_major;
+  uint8_t app_fw_minor;
+  uint8_t bl_fw_major;
+  uint8_t bl_fw_minor;
+} pem_firmware_regs_t;
+
 typedef struct _pem_eeprom_reg_t {
   pem_control_t control;
   pem_alert_t alert;
@@ -297,11 +357,31 @@ typedef struct _pem_eeprom_reg_t {
   pem_ilim_adjust_t ilim_adjust;
 } pem_eeprom_reg_t;
 
+typedef struct _delta_hdr_t {
+  uint8_t crc[2];
+  uint16_t page_start;
+  uint16_t page_end;
+  uint16_t byte_per_blk;
+  uint16_t blk_per_page;
+  uint8_t uc;
+  uint8_t app_fw_major;
+  uint8_t app_fw_minor;
+  uint8_t bl_fw_major;
+  uint8_t bl_fw_minor;
+  uint8_t fw_id_len;
+  uint8_t fw_id[16];
+  uint8_t compatibility;
+} delta_hdr_t;
+
 int is_pem_prsnt(uint8_t num, uint8_t *status);
+int get_mfr_model(uint8_t num, uint8_t *block);
+int do_update_pem(uint8_t num, const char *file, const char *vendor, _Bool force);
 int archive_pem_chips(uint8_t num);
+int log_pem_critical_regs(uint8_t num);
 int get_eeprom_info(uint8_t mum, const char *option);
 int get_pem_info(uint8_t num);
 int get_blackbox_info(uint8_t num, const char *option);
+int get_archive_log(uint8_t num, const char *option);
 
 #ifdef __cplusplus
 }

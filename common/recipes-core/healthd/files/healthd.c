@@ -77,6 +77,8 @@
 #define AST_SRAM_BMC_REBOOT_BASE      0x1E721000
 #define BMC_REBOOT_BY_KERN_PANIC(base) *((uint32_t *)(base + 0x200))
 #define BMC_REBOOT_BY_CMD(base) *((uint32_t *)(base + 0x204))
+#define BMC_REBOOT_SIG(base) *((uint32_t *)(base + 0x208))
+#define BOOT_MAGIC                    0xFB420054
 #define BIT_RECORD_LOG                (1 << 8)
 // kernel panic
 #define FLAG_KERN_PANIC               (1 << 0)
@@ -87,6 +89,8 @@
 #define HB_SLEEP_TIME (5 * 60)
 #define HB_TIMESTAMP_COUNT (60 * 60 / HB_SLEEP_TIME)
 #define SLED_TS_TIMEOUT 100    //SLED Time Sync Timeout
+
+#define KV_KEY_IMAGE_VERSIONS "image_versions"
 
 struct i2c_bus_s {
   uint32_t offset;
@@ -118,6 +122,7 @@ struct threshold_s {
   int log_level;
   bool reboot;
   bool bmc_error_trigger;
+  bool bmc_mem_clear;
 };
 
 enum {
@@ -154,6 +159,7 @@ static size_t cpu_threshold_num = 0;
 static char *mem_monitor_name = "BMC Memory utilization";
 static bool mem_monitor_enabled = false;
 static bool mem_enable_panic = false;
+static int mem_min_free_kbytes = 0;
 static unsigned int mem_window_size = DEFAULT_WINDOW_SIZE;
 static unsigned int mem_monitor_interval = DEFAULT_MONITOR_INTERVAL;
 static struct threshold_s *mem_threshold;
@@ -194,6 +200,11 @@ static bool vboot_state_check = false;
 
 /* BMC time stamp enabled */
 static bool bmc_timestamp_enabled = false;
+
+/* PFR status Monitor */
+extern bool pfr_monitor_enabled;
+extern void initialize_pfr_monitor_config(json_t *);
+extern void * pfr_monitor();
 
 static void
 initialize_threshold(const char *target, json_t *thres, struct threshold_s *t) {
@@ -250,6 +261,8 @@ initialize_threshold(const char *target, json_t *thres, struct threshold_s *t) {
       t->reboot = true;
     } else if(!strcmp(act, "bmc-error-trigger")) {
       t->bmc_error_trigger = true;
+    } else if(!strcmp(act, "bmc-mem-clear")) {
+      t->bmc_mem_clear = true;
     }
   }
 }
@@ -333,6 +346,10 @@ initialize_mem_config(json_t *conf) {
   tmp = json_object_get(conf, "enable_panic_on_oom");
   if (tmp && json_is_true(tmp)) {
     mem_enable_panic = true;
+  }
+  tmp = json_object_get(conf, "min_free_kbytes");
+  if (tmp && json_is_number(tmp)) {
+    mem_min_free_kbytes = json_integer_value(tmp);
   }
   tmp = json_object_get(conf, "window_size");
   if (tmp && json_is_number(tmp)) {
@@ -541,6 +558,7 @@ initialize_configuration(void) {
   initialize_ecc_config(json_object_get(conf, "ecc_monitoring"));
   initialize_bmc_health_config(json_object_get(conf, "bmc_health"));
   initialize_nm_monitor_config(json_object_get(conf, "nm_monitor"));
+  initialize_pfr_monitor_config(json_object_get(conf, "pfr_monitor"));
   initialize_vboot_config(json_object_get(conf, "verified_boot"));
   initialize_bmc_timestamp_config(json_object_get(conf, "bmc_timestamp"));
 
@@ -563,7 +581,7 @@ static void threshold_assert_check(const char *target, float value, struct thres
       syslog(thres->log_level, "Rebooting BMC; latest uptime: %ld sec", info.uptime);
 
       sleep(1);
-      reboot(RB_AUTOBOOT);
+      pal_bmc_reboot(RB_AUTOBOOT);
     }
     if (thres->bmc_error_trigger) {
       pthread_mutex_lock(&global_error_mutex);
@@ -580,6 +598,11 @@ static void threshold_assert_check(const char *target, float value, struct thres
       }
       pthread_mutex_unlock(&global_error_mutex);
       pal_bmc_err_enable(target);
+    }
+    if (thres->bmc_mem_clear) {
+      if (system("sync;/sbin/sysctl vm.drop_caches=3 > /dev/null")){
+        syslog(LOG_ERR, "Clear BMC Memory failed\n");
+      }
     }
   }
 }
@@ -643,7 +666,7 @@ static void ecc_threshold_assert_check(const char *target, int value,
       }
     }
     if (thres->reboot) {
-      reboot(RB_AUTOBOOT);
+      pal_bmc_reboot(RB_AUTOBOOT);
     }
     if (thres->bmc_error_trigger) {
       pthread_mutex_lock(&global_error_mutex);
@@ -819,6 +842,7 @@ CPU_usage_monitor() {
   float cpu_util_avg, cpu_util_total;
   float cpu_utilization[cpu_window_size];
   FILE *fp;
+  int ret;
 
   sleep(180); //Wait 180s for BMC to idle stage.
 
@@ -838,10 +862,15 @@ CPU_usage_monitor() {
       retry++;
       continue;
     }
-    retry = 0;
 
-    fscanf(fp, "%s %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+    ret = fscanf(fp, "%s %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
                 cpu, &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal, &guest, &guest_nice);
+    if (ret != 11) {
+      syslog(LOG_WARNING, "Cannot parse CPU statistic. Stop %s\n", __func__);
+      retry++;
+      continue;
+    }
+    retry = 0;
 
     fclose(fp);
 
@@ -924,11 +953,19 @@ memory_usage_monitor() {
   int i, error, timer = 0, ready_flag = 0, retry = 0;
   float mem_util_avg, mem_util_total;
   float mem_utilization[mem_window_size];
+  char cmd[128];
 
   memset(mem_utilization, 0, sizeof(float) * mem_window_size);
 
   if (mem_enable_panic) {
     set_panic_on_oom();
+  }
+
+  if (mem_min_free_kbytes > 0) {
+    snprintf(cmd, sizeof(cmd), "/sbin/sysctl -w vm.min_free_kbytes=%d >/dev/null", mem_min_free_kbytes);
+    if (system(cmd)) {
+      syslog(LOG_ERR, "set min_free_kbytes failed");
+    }
   }
 
   while (1) {
@@ -1205,14 +1242,26 @@ crit_proc_ongoing_handle(bool is_crit_proc_updating)
   last_is_crit_proc_updating = is_crit_proc_updating;
 
   if ( true == is_crit_proc_updating ) { // forbid the execution permission
-    system("chmod 666 /sbin/shutdown.sysvinit");
-    system("chmod 666 /sbin/halt.sysvinit");
-    system("chmod 666 /sbin/init");
+    if (system("chmod 666 /sbin/shutdown.sysvinit") != 0) {
+      syslog(LOG_ERR, "Disabling shutdown failed\n");
+    }
+    if (system("chmod 666 /sbin/halt.sysvinit") != 0) {
+      syslog(LOG_ERR, "Disabling halt failed\n");
+    }
+    if (system("chmod 666 /sbin/init") != 0) {
+      syslog(LOG_ERR, "Disabling init failed\n");
+    }
   }
   else {
-    system("chmod 4755 /sbin/shutdown.sysvinit");
-    system("chmod 4755 /sbin/halt.sysvinit");
-    system("chmod 4755 /sbin/init");
+    if (system("chmod 4755 /sbin/shutdown.sysvinit") != 0) {
+      syslog(LOG_ERR, "Enabling shutdown failed\n");
+    }
+    if (system("chmod 4755 /sbin/halt.sysvinit") != 0) {
+      syslog(LOG_ERR, "Enabling halt failed\n");
+    }
+    if (system("chmod 4755 /sbin/init") != 0) {
+      syslog(LOG_ERR, "Enabling init failed\n");
+    }
   }
 }
 
@@ -1224,22 +1273,22 @@ crit_proc_monitor() {
   bool is_crashdump_ongoing = false;
   bool is_cplddump_ongoing = false;
 
-  while(1) 
+  while(1)
   {
     //if is_fw_updating == true, means BMC is Updating a Device FW
     is_fw_updating = pal_is_fw_update_ongoing_system();
-    
+
     //if is_autodump_ongoing == true, modify the permission
     is_crashdump_ongoing = pal_is_crashdump_ongoing_system();
 
     //if is_cplddump_ongoing == true, modify the permission
     is_cplddump_ongoing = pal_is_cplddump_ongoing_system();
 
-    if ( (true == is_fw_updating) || (true == is_crashdump_ongoing) || (true == is_cplddump_ongoing) ) 
+    if ( (true == is_fw_updating) || (true == is_crashdump_ongoing) || (true == is_cplddump_ongoing) )
     {
       crit_proc_ongoing_handle(true);
     }
-    
+
     if ( (false == is_fw_updating) && (false == is_crashdump_ongoing) && (false == is_cplddump_ongoing) )
     {
       crit_proc_ongoing_handle(false);
@@ -1267,61 +1316,102 @@ static int log_count(const char *str)
   return ret;
 }
 
-static int get_curr_version(char *vers)
+/* parser curr_version from /etc/issue
+  and return version string length on success
+  otherwise return 0 as failure */
+static size_t get_curr_version(char *buf, size_t buflen)
 {
   FILE *fp = fopen("/etc/issue", "r");
-  int ret = -1;
+  size_t ret = 0;
+  char *vers = 0;
   if (fp) {
-    if(fscanf(fp, "OpenBMC Release %s\n", vers) == 1) {
-      ret = 0;
+    if(fscanf(fp, "OpenBMC Release %ms\n", &vers) == 1) {
+      ret = strnlen(vers, buflen);
+      if ( ret < buflen) {
+        snprintf(buf, buflen, "%s", vers);
+      } else {
+        ret = 0;
+      }
     }
     fclose(fp);
   }
+  if (vers) free(vers);
   return ret;
+}
+
+static char*
+get_latest_n_versions(char* orig, size_t orig_len, size_t cnt)
+{
+  char* p = orig;
+  if (p == 0)
+    return p;
+  p += orig_len;
+  while (cnt && p > orig) {
+    p--;
+    if (*p == ',') cnt--;
+  }
+  if (*p == ',') {
+    p++;
+  }
+  return p;
 }
 
 static void store_curr_version(void)
 {
-  char versions_raw[MAX_VALUE_LEN] = {0};
-  char versions[VERSION_HISTORY_COUNT][MAX_VALUE_LEN] = {{0}};
-  char curr_version[MAX_VALUE_LEN] = {0};
-  char *saveptr = NULL, *vers;
-  size_t num_vers = 0, i;
+  static char old_versions[MAX_VALUE_LEN*2];
+  static char curr_version[MAX_VALUE_LEN];
+  char *new_versions;
+  size_t old_versions_len;
+  size_t new_versions_len;
 
-  if (get_curr_version(curr_version)) {
+  if (0 == get_curr_version(curr_version, sizeof(curr_version))) {
     syslog(LOG_ERR, "Getting version failed!\n");
     return;
   }
 
-  if (0 != kv_get("image_versions", versions_raw, NULL, KV_FPERSIST)) {
-    kv_set("image_versions", curr_version, 0, KV_FPERSIST);
-    return;
-  }
-  for (vers = strtok_r(versions_raw, ",", &saveptr), num_vers = 0;
-      vers != NULL;
-      vers = strtok_r(NULL, ",", &saveptr), num_vers++) {
-    strncpy(versions[num_vers], vers, MAX_VALUE_LEN);
-  }
-  if (!strcmp(versions[num_vers - 1], curr_version)) {
-    /* Current version is the same as the last stored
-     * one */
+  if (kv_get(KV_KEY_IMAGE_VERSIONS, old_versions, &old_versions_len, KV_FPERSIST)) {
+    if (kv_set(KV_KEY_IMAGE_VERSIONS, curr_version, 0, KV_FPERSIST)) {
+      syslog(LOG_ERR, "Setting image version failed");
+    }
     return;
   }
 
-  if (num_vers >= VERSION_HISTORY_COUNT) {
-    for (i = 1; i < num_vers; i++) {
-      strcpy(versions[i - 1], versions[i]);
+  /* kv-store won't gurantee null terminate when request to return value len
+   * so terminate it here explicitly */
+  old_versions[old_versions_len] = '\0';
+  /* check whether current version is the same as last version. */
+  if (strcmp( get_latest_n_versions(old_versions, old_versions_len, 1), 
+              curr_version) == 0) {
+    /* version not changed */
+    return;
+  }
+
+  /* otherwise append curr_version */
+  new_versions = old_versions;
+  strcat(new_versions, ",");
+  strncat(new_versions, curr_version, MAX_VALUE_LEN);
+  new_versions_len = strnlen(new_versions, sizeof(old_versions));
+
+  /* chop off oldest versions until it fits MAX_VALUE_LEN */
+  while (new_versions_len >= MAX_VALUE_LEN) {
+    while (*new_versions && *new_versions != ',') {
+      new_versions++;
+      new_versions_len--;
     }
-    num_vers--;
+    if (*new_versions == ',') {
+      new_versions++;
+      new_versions_len--;
+    }
   }
-  strcpy(versions[num_vers], curr_version);
-  num_vers++;
-  strcpy(versions_raw, versions[0]);
-  for (i = 1; i < num_vers; i++) {
-    strcat(versions_raw, ",");
-    strcat(versions_raw, versions[i]);
-  }
-  if (kv_set("image_versions", versions_raw, 0, KV_FPERSIST)) {
+
+  /* chop off oldest version and only keep at most VERSION_HISTORY_COUNT
+   * this is to backwards comptable with healthd which will crash
+   * when parser file contain history contain version more than VERSION_HISTORY_COUNT
+   */
+  new_versions = get_latest_n_versions(new_versions, new_versions_len,
+    VERSION_HISTORY_COUNT);
+  /* save the new versions string */
+  if (kv_set(KV_KEY_IMAGE_VERSIONS, new_versions, 0, KV_FPERSIST)) {
     syslog(LOG_ERR, "Setting image version failed");
   }
 }
@@ -1425,6 +1515,7 @@ log_reboot_cause(char *sled_off_time)
     // Initial BMC reboot flag
     BMC_REBOOT_BY_KERN_PANIC(bmc_reboot_base) = 0x0;
     BMC_REBOOT_BY_CMD(bmc_reboot_base) = 0x0;
+    BMC_REBOOT_SIG(bmc_reboot_base) = BOOT_MAGIC;
   } else {
     kern_panic_flag = BMC_REBOOT_BY_KERN_PANIC(bmc_reboot_base);
     reboot_detected_flag = BMC_REBOOT_BY_CMD(bmc_reboot_base);
@@ -1500,7 +1591,7 @@ timestamp_handler()
         sleep(1);
         continue;
       }
-      
+
       // If get the correct time or time sync timeout
       time_init = SLED_TS_TIMEOUT;
 
@@ -1526,7 +1617,7 @@ timestamp_handler()
 
     sleep(HB_SLEEP_TIME);
   }
-  
+
   return NULL;
 }
 
@@ -1547,6 +1638,7 @@ main(int argc, char **argv) {
   pthread_t tid_ecc_monitor;
   pthread_t tid_bmc_health_monitor;
   pthread_t tid_nm_monitor;
+  pthread_t tid_pfr_monitor;
   pthread_t tid_timestamp_handler;
 
   if (argc > 1) {
@@ -1561,7 +1653,7 @@ main(int argc, char **argv) {
 
   initialize_configuration();
 
-  if (vboot_state_check) {
+  if (vboot_state_check && vboot_supported()) {
     check_vboot_state();
     /* curr version is stored only when vboot is
      * successful */
@@ -1625,6 +1717,13 @@ main(int argc, char **argv) {
     }
   }
 
+  if (pfr_monitor_enabled) {
+    if (pthread_create(&tid_pfr_monitor, NULL, pfr_monitor, NULL)) {
+      syslog(LOG_WARNING, "pthread_create for pfr monitor error\n");
+      exit(1);
+    }
+  }
+
   if (pthread_create(&tid_crit_proc_monitor, NULL, crit_proc_monitor, NULL)) {
     syslog(LOG_WARNING, "pthread_create for FW Update Monitor error\n");
     exit(1);
@@ -1636,7 +1735,7 @@ main(int argc, char **argv) {
       exit(1);
     }
   }
-  
+
 
   pthread_join(tid_watchdog, NULL);
 
@@ -1665,6 +1764,10 @@ main(int argc, char **argv) {
     pthread_join(tid_nm_monitor, NULL);
   }
 
+  if (pfr_monitor_enabled) {
+    pthread_join(tid_pfr_monitor, NULL);
+  }
+
   pthread_join(tid_crit_proc_monitor, NULL);
 
   if (bmc_timestamp_enabled) {
@@ -1673,4 +1776,3 @@ main(int argc, char **argv) {
 
   return 0;
 }
-

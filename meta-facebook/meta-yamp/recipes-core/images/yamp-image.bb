@@ -4,9 +4,6 @@ inherit kernel_fitimage
 
 require recipes-core/images/fb-openbmc-image.bb
 
-# Changing the image compression from gz to lzma achieves 30% saving (~3M).
-IMAGE_FSTYPES += "cpio.lzma.u-boot"
-
 # Include modules in rootfs
 IMAGE_INSTALL += " \
   packagegroup-openbmc-base \
@@ -26,4 +23,5 @@ IMAGE_INSTALL += " \
   led-controld \
   spatula \
   ncsi-util \
+  libcpldupdate-dll-ioctl \
   "

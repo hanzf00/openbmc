@@ -360,10 +360,19 @@ void pldmCreateActivateFirmwareCmd(pldm_cmd_req *pPldmCdb)
 }
 
 
+void pldmCreateCancelUpdateCmd(pldm_cmd_req *pPldmCdb)
+{
+  printf("\n\nCMD_CANCEL_UPDATE\n");
+
+  genReqCommonFields(PLDM_TYPE_FIRMWARE_UPDATE, CMD_CANCEL_UPDATE, &(pPldmCdb->common[0]));
+  pPldmCdb->payload_size = PLDM_COMMON_REQ_LEN;
+}
+
+
 // helper function to check if a given UUID is a PLDM FW Package
 int isPldmFwUuid(char *uuid)
 {
-  return strncmp(uuid, PLDM_FW_UUID, PLDM_FW_UUID_LEN);
+  return (!strncmp(uuid, PLDM_FW_UUID, PLDM_FW_UUID_LEN));
 }
 
 
@@ -374,7 +383,7 @@ void printHdrInfo(pldm_fw_pkg_hdr_info_t *hdr_info, int printVersion)
   printf("  UUID: ");
   for (i=0; i<16; ++i)
     printf("%x", hdr_info->uuid[i]);
-  printf("    PLDM UUID Y/N? (%C)\n", isPldmFwUuid((char *)(hdr_info->uuid))? 'N':'Y');
+  printf("    PLDM UUID Y/N? (%C)\n", isPldmFwUuid((char *)(hdr_info->uuid))? 'Y':'N');
   printf("  headerRevision: 0x%x\n", hdr_info->headerRevision);
   printf("  headerSize: 0x%x\n", hdr_info->headerSize);
   printf("  componentBitmapBitLength: 0x%x\n", hdr_info->componentBitmapBitLength);
@@ -538,6 +547,11 @@ init_pkg_hdr_info(char *path, pldm_fw_pkg_hdr_t** pFwPkgHdr, int *pOffset)
   printHdrInfo((*pFwPkgHdr)->phdrInfo, 1);
   *pOffset += offsetof(pldm_fw_pkg_hdr_info_t, versionString) +
              (*pFwPkgHdr)->phdrInfo->versionStringLength;
+  if (!isPldmFwUuid((char *)((*pFwPkgHdr)->phdrInfo->uuid))) {
+    printf("Not a valid PLDM package, exiting\n");
+    return -1;
+  }
+
   return 0;
 }
 
@@ -767,11 +781,14 @@ int handlePldmReqFwData(pldm_fw_pkg_hdr_t *pkgHdr, pldm_cmd_req *pCmd, pldm_resp
                    (pReqDataCmd->length - compBytesLeft) : 0;
 
 
-
-  printf("%s offset = 0x%x, length = 0x%x, compBytesLeft=%d, numPadding=%d\n",
+  printf("\r%s offset = 0x%x, length = 0x%x, compBytesLeft=%d, numPadding=%d",
          __FUNCTION__, pReqDataCmd->offset, pReqDataCmd->length, compBytesLeft,
          numPaddingNeeded);
+  fflush(stdout);
+
   memcpy(pldmRes->common, pCmd->common, PLDM_COMMON_REQ_LEN);
+  // clear Req bit in PLDM response header
+  pldmRes->common[PLDM_IID_OFFSET] &= PLDM_RESP_MASK;
   // hard code success for now, need to check length in the future
   pldmRes->common[PLDM_CC_OFFSET] = CC_SUCCESS;
 
@@ -800,6 +817,8 @@ int handlePldmFwTransferComplete(pldm_cmd_req *pCmd, pldm_response *pRes)
   }
 
   memcpy(pRes->common, pCmd->common, PLDM_COMMON_REQ_LEN);
+  // clear Req bit in PLDM response header
+  pRes->common[PLDM_IID_OFFSET] &= PLDM_RESP_MASK;
   pRes->common[PLDM_CC_OFFSET] = CC_SUCCESS;
   pRes->resp_size = PLDM_COMMON_RES_LEN;
   return ret;
@@ -818,6 +837,8 @@ int handlePldmVerifyComplete(pldm_cmd_req *pCmd, pldm_response *pRes)
   }
 
   memcpy(pRes->common, pCmd->common, PLDM_COMMON_REQ_LEN);
+  // clear Req bit in PLDM response header
+  pRes->common[PLDM_IID_OFFSET] &= PLDM_RESP_MASK;
   pRes->common[PLDM_CC_OFFSET] = CC_SUCCESS;
   pRes->resp_size = PLDM_COMMON_RES_LEN;
   return ret;
@@ -837,6 +858,8 @@ int handlePldmFwApplyComplete(pldm_cmd_req *pCmd, pldm_response *pRes)
           pReqDataCmd->applyResult, pReqDataCmd->compActivationMethodsModification);
 
   memcpy(pRes->common, pCmd->common, PLDM_COMMON_REQ_LEN);
+  // clear Req bit in PLDM response header
+  pRes->common[PLDM_IID_OFFSET] &= PLDM_RESP_MASK;
   pRes->common[PLDM_CC_OFFSET] = CC_SUCCESS;
   pRes->resp_size = PLDM_COMMON_RES_LEN;
   return ret;
@@ -868,7 +891,7 @@ int pldmFwUpdateCmdHandler(pldm_fw_pkg_hdr_t *pkgHdr, pldm_cmd_req *pCmd, pldm_r
       ret = handlePldmFwApplyComplete(pCmd, pRes);
       break;
     default:
-      printf("unkown cmd %d\n",cmd);
+      printf("unknown cmd %d\n",cmd);
       dbgPrintCdb(pCmd);
       ret = -1;
       break;
@@ -876,6 +899,17 @@ int pldmFwUpdateCmdHandler(pldm_fw_pkg_hdr_t *pkgHdr, pldm_cmd_req *pCmd, pldm_r
   return ret;
 }
 
+
+void setPldmTimeout(int pldmCmd, int *timeout_sec)
+{
+  if (pldmCmd == CMD_REQUEST_FIRMWARE_DATA) {
+    // special timeout value (UA_T2) for Request FW data as specified in DSP0267
+    *timeout_sec = UA_T2;
+  } else {
+    // default time out is State Change Timeout (in DSP0267, tbl 2 timing spec)
+    *timeout_sec = UA_T3;
+  }
+}
 
 // PLDM Base commands
 

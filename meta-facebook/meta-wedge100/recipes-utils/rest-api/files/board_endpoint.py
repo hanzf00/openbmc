@@ -17,9 +17,12 @@
 # 51 Franklin Street, Fifth Floor,
 # Boston, MA 02110-1301 USA
 #
+import asyncio
+
 import rest_fw_ver
 import rest_i2cflush
 import rest_modbus
+import rest_presence
 import rest_usb2i2c_reset
 from aiohttp import web
 from rest_utils import dumps_bytestr, get_endpoints
@@ -42,13 +45,50 @@ class boardApp_Handler:
         )
 
     async def rest_firmware_info_all_hdl(self, request):
-        fw = await rest_fw_ver.get_all_fw_ver()
-        return web.json_response(fw, dumps=dumps_bytestr)
+        versions = await asyncio.gather(
+            rest_fw_ver.get_sys_cpld_ver(),
+            rest_fw_ver.get_fan_cpld_ver(),
+            rest_fw_ver.get_internal_switch_config(),
+        )
+        all_versions = {
+            "SYS_CPLD": versions[0],
+            "FAN_CPLD": versions[1],
+            "INTERNAL_SWITCH_CONFIG": versions[2],
+        }
+        return web.json_response(all_versions, dumps=dumps_bytestr)
+
+    async def rest_firmware_info_sys_hdl(self, request):
+        cpld_version = await rest_fw_ver.get_sys_cpld_ver()
+        response = {"SYS_CPLD": cpld_version}
+        return web.json_response(response, dumps=dumps_bytestr)
+
+    async def rest_firmware_info_fan_hdl(self, request):
+        fan_version = await rest_fw_ver.get_fan_cpld_ver()
+        response = {"FAN_CPLD": fan_version}
+        return web.json_response(response, dumps=dumps_bytestr)
+
+    async def rest_firmware_info_internal_switch_config_hdl(self, request):
+        internal_switch_config = await rest_fw_ver.get_internal_switch_config()
+        response = {"INTERNAL_SWITCH_CONFIG": internal_switch_config}
+        return web.json_response(response, dumps=dumps_bytestr)
 
     async def rest_firmware_info_hdl(self, request):
         details = {
             "Information": {"Description": "Firmware versions"},
             "Actions": [],
-            "Resources": ["all"],
+            "Resources": ["all", "fan", "sys", "internal_switch_config"],
         }
         return web.json_response(details, dumps=dumps_bytestr)
+
+    async def rest_presence_hdl(self, request):
+        return web.json_response(rest_presence.get_presence_info(), dumps=dumps_bytestr)
+
+    async def rest_presence_pem_hdl(self, request):
+        return web.json_response(
+            rest_presence.get_presence_info_pem(), dumps=dumps_bytestr
+        )
+
+    async def rest_presence_psu_hdl(self, request):
+        return web.json_response(
+            rest_presence.get_presence_info_psu(), dumps=dumps_bytestr
+        )

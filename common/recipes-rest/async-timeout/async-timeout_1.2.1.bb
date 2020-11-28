@@ -7,10 +7,11 @@ SRC_URI = "https://pypi.python.org/packages/eb/a3/9fbe8bf7de4128d8f5562ca0b7b2f8
 SRC_URI[md5sum] = "e71f9b197498f917864e29af7a5defa0"
 SRC_URI[sha256sum] = "380e9bfd4c009a14931ffe487499b0906b00b3378bb743542cfd9fbb6d8e4657"
 
-S = "${WORKDIR}/${PN}-${PV}"
+S = "${WORKDIR}/${BPN}-${PV}"
 
-dst="/usr/lib/python3.5/site-packages/async_timeout.egg-info"
-dst1="/usr/lib/python3.5/site-packages/async_timeout"
+inherit python3-dir
+dst="${PYTHON_SITEPACKAGES_DIR}/async_timeout.egg-info"
+dst1="${PYTHON_SITEPACKAGES_DIR}/async_timeout"
 
 do_install() {
   mkdir -p ${D}/${dst}
@@ -29,3 +30,4 @@ do_compile() {
 }
 
 FILES_${PN} = "${dst} ${dst1}"
+BBCLASSEXTEND += "native nativesdk"

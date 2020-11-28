@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2018-present Facebook. All Rights Reserved.
 #
@@ -17,6 +17,7 @@
 # 51 Franklin Street, Fifth Floor,
 # Boston, MA 02110-1301 USA
 #
+import os
 import re
 import time
 from abc import abstractmethod
@@ -56,7 +57,7 @@ class BaseFansTest(object):
             self.kill_fan_ctrl_cmd, None, "Kill Fan Controller cmd not set"
         )
         for cmd in self.kill_fan_ctrl_cmd:
-            run_shell_cmd(cmd)
+            run_shell_cmd(cmd, ignore_err=True)
 
     def start_fan_controller(self):
         """
@@ -66,7 +67,7 @@ class BaseFansTest(object):
             self.start_fan_ctrl_cmd, None, "Kill Fan Controller cmd not set"
         )
         for cmd in self.start_fan_ctrl_cmd:
-            run_shell_cmd(cmd)
+            run_shell_cmd(cmd, ignore_err=True)
         time.sleep(10)  # allow time for fans to be properly set
 
     @abstractmethod

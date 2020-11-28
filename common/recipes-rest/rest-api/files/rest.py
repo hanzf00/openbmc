@@ -27,14 +27,13 @@ import logging.config
 import os.path
 import ssl
 import sys
-import syslog
 
 from aiohttp import web
-from common_tree import init_common_tree
-from node import node
-from plat_tree import init_plat_tree
-from rest_config import parse_config
-from tree import tree
+from aiohttp.log import access_logger
+from common_logging import ACCESS_LOG_FORMAT, get_logger_config
+from common_middlewares import auth_enforcer, jsonerrorhandler
+from rest_config import load_acl_provider, parse_config
+from setup_plat_routes import setup_plat_routes
 
 
 configpath = "/etc/rest.cfg"
@@ -54,49 +53,30 @@ for opt, arg in opts:
 
 config = parse_config(configpath)
 
-LOGGER_CONF = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {"default": {"format": "%(message)s"}},
-    "handlers": {
-        "file_handler": {
-            "level": "INFO",
-            "formatter": "default",
-            "class": "logging.handlers.RotatingFileHandler",
-            "filename": config["logfile"],
-            "maxBytes": 1048576,
-            "backupCount": 3,
-            "encoding": "utf8",
-        }
-    },
-    "loggers": {
-        "": {"handlers": ["file_handler"], "level": "DEBUG", "propagate": True}
-    },
-}
-logging.config.dictConfig(LOGGER_CONF)
+
+logging.config.dictConfig(get_logger_config(config))
 
 
 servers = []
 
 
-app = web.Application()
-if config["writable"]:
-    syslog.syslog(syslog.LOG_INFO, "REST: Launched with Read/Write Mode")
-else:
-    syslog.syslog(syslog.LOG_INFO, "REST: Launched with Read Only Mode")
-
-root = init_common_tree()
-root.merge(init_plat_tree())
-root.setup(app, config["writable"])
+app = web.Application(middlewares=[jsonerrorhandler, auth_enforcer])
+setup_plat_routes(app, config)
 
 
 loop = asyncio.get_event_loop()
-handler = app.make_handler()
+handler = app.make_handler(
+    access_log=access_logger, access_log_format=ACCESS_LOG_FORMAT
+)
 
 servers.extend([loop.create_server(handler, "*", port) for port in config["ports"]])
 
 if config["ssl_certificate"] and os.path.isfile(config["ssl_certificate"]):
     ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    if config["ssl_ca_certificate"]:
+        # Set up mutual TLS authentication if config has ssl_ca_certificate
+        ssl_context.load_verify_locations(config["ssl_ca_certificate"])
+        ssl_context.verify_mode = ssl.CERT_OPTIONAL
     ssl_context.load_cert_chain(
         certfile=config["ssl_certificate"], keyfile=config["ssl_key"]  # May be None
     )
@@ -106,6 +86,9 @@ if config["ssl_certificate"] and os.path.isfile(config["ssl_certificate"]):
             for port in config["ssl_ports"]
         ]
     )
+
+
+app["acl_provider"] = load_acl_provider(config)
 
 srv = loop.run_until_complete(asyncio.gather(*servers, loop=loop))
 try:

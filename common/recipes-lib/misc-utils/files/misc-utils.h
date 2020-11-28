@@ -23,12 +23,38 @@
 extern "C" {
 #endif
 
+#include <time.h>
+#include <errno.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(a)	(sizeof(a) / sizeof((a)[0]))
 #endif
+
+/* Retry till condition is true.
+   Helper macro to consolidate retry logic. Usage example:
+  if (retry_cond((rc = stuff(1, 4)) == 0, 4, 1000)) {
+    printf("stuff failed with %d even after 4 attempts\n", rc);
+  } else {
+    printf("Stuff succeeded!\n");
+  }
+*/
+#define retry_cond(oper, _num_retries, _msec) ({                          \
+  int retries;                                                            \
+  int num_retries = (int)(_num_retries);                                  \
+  int msec = (int)(_msec);                                                \
+  struct timespec ts;                                                     \
+  ts.tv_sec = msec / 1000; ts.tv_nsec = (msec % 1000) * 1000000;          \
+  for (retries = 0; retries < num_retries && !(oper); retries++) {        \
+    int res;                                                              \
+    do {                                                                  \
+      res = nanosleep(&ts, &ts);                                          \
+    } while (res && errno == EINTR);                                      \
+  }                                                                       \
+  retries == num_retries ? (!(oper) ? -1 : 0) : 0;                        \
+})
 
 typedef enum {
 	CPU_MODEL_INVALID = -1,
@@ -44,6 +70,8 @@ typedef enum {
 	SOC_MODEL_MAX,
 } soc_model_t;
 
+typedef uint32_t k_version_t;
+
 /*
  * String utility functions.
  */
@@ -52,6 +80,12 @@ char* str_rstrip(char *input);
 char* str_strip(char *input);
 bool str_startswith(const char *str, const char *pattern);
 bool str_endswith(const char *str, const char *pattern);
+
+/*
+ * Device IO utility functions.
+ */
+int device_read(const char *device, int *value);
+int device_write_buff(const char *device, const char *value);
 
 /*
  * File IO utility functions.
@@ -74,6 +108,9 @@ bool path_islink(const char *path);
  */
 cpu_model_t get_cpu_model(void);
 soc_model_t get_soc_model(void);
+k_version_t get_kernel_version(void);
+int single_instance_lock(const char *name);
+int single_instance_unlock(int fd);
 
 #ifdef __cplusplus
 } /* extern "C" */

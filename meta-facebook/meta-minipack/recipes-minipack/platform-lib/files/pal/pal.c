@@ -37,14 +37,25 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <ctype.h>
 #include <linux/limits.h>
+#include <linux/version.h>
 #include "pal.h"
+#include "pal_sensors.h"
 #include <math.h>
 #include <facebook/bic.h>
 #include <openbmc/kv.h>
 #include <openbmc/obmc-i2c.h>
-#include <openbmc/obmc-sensor.h>
 #include <openbmc/sensor-correction.h>
+#include <openbmc/misc-utils.h>
+#include <openbmc/log.h>
+
+#define RUN_SHELL_CMD(_cmd)                              \
+  do {                                                   \
+    int _ret = system(_cmd);                             \
+    if (_ret != 0)                                       \
+      OBMC_WARN("'%s' command returned %d", _cmd, _ret); \
+  } while (0)
 
 typedef struct {
   char name[32];
@@ -525,6 +536,7 @@ size_t psu4_sensor_cnt = sizeof(psu4_sensor_list)/sizeof(uint8_t);
 static sensor_info_t g_sinfo[MAX_NUM_FRUS][MAX_SENSOR_NUM] = {0};
 
 static float hsc_rsense[MAX_NUM_FRUS] = {0};
+static int hsc_power_div = 1;
 
 const char pal_fru_list[] = "all, scm, smb, pim1, pim2, pim3, \
 pim4, pim5, pim6, pim7, pim8, psu1, psu2, psu3, psu4";
@@ -762,13 +774,17 @@ pal_del_i2c_device(uint8_t bus, uint8_t addr) {
 }
 
 int
-pal_get_pim_type(uint8_t fru) {
-  int retry = 10, ret = -1, val;
+pal_get_pim_type(uint8_t fru, int retry) {
+  int ret = -1, val;
   char path[LARGEST_DEVICE_NAME + 1];
   uint8_t bus = ((fru - FRU_PIM1) * 8) + 80;
 
   snprintf(path, LARGEST_DEVICE_NAME,
            I2C_SYSFS_DEVICES"/%d-0060/board_ver", bus);
+
+  if (retry < 0) {
+    retry = 0;
+  }
 
   while ((ret = read_device(path, &val)) != 0 && retry--) {
     msleep(500);
@@ -852,7 +868,6 @@ pim_thresh_array_init(uint8_t fru) {
       i = fru - FRU_PIM1;
       pim_sensor_threshold[PIM1_SENSOR_TEMP1+(i*0x15)][UCR_THRESH] = 70;
       pim_sensor_threshold[PIM1_SENSOR_TEMP2+(i*0x15)][UCR_THRESH] = 80;
-      pim_sensor_threshold[PIM1_SENSOR_QSFP_TEMP+i][UCR_THRESH] = 58;
       pim_sensor_threshold[PIM1_SENSOR_HSC_VOLT+(i*0x15)][UCR_THRESH] = 12.6;
       pim_sensor_threshold[PIM1_SENSOR_HSC_VOLT+(i*0x15)][LCR_THRESH] = 11.4;
       pim_sensor_threshold[PIM1_SENSOR_HSC_CURR+(i*0x15)][UCR_THRESH] = 12;
@@ -860,6 +875,7 @@ pim_thresh_array_init(uint8_t fru) {
 
       type = pal_get_pim_type_from_file(fru);
       if (type == PIM_TYPE_16Q) {
+        pim_sensor_threshold[PIM1_SENSOR_QSFP_TEMP+i][UCR_THRESH] = 58;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT1+(i*0x15)][UCR_THRESH] = 0.82;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT1+(i*0x15)][LCR_THRESH] = 0.56;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT2+(i*0x15)][UCR_THRESH] = 0.864;
@@ -893,6 +909,7 @@ pim_thresh_array_init(uint8_t fru) {
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT16+(i*0x15)][UCR_THRESH] = 1.944;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT16+(i*0x15)][LCR_THRESH] = 1.656;
       } else if (type == PIM_TYPE_16O) {
+        pim_sensor_threshold[PIM1_SENSOR_QSFP_TEMP+i][UCR_THRESH] = 60;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT1+(i*0x15)][UCR_THRESH] = 5.25;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT1+(i*0x15)][LCR_THRESH] = 4.75;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT2+(i*0x15)][UCR_THRESH] = 3.465;
@@ -904,13 +921,13 @@ pim_thresh_array_init(uint8_t fru) {
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT5+(i*0x15)][UCR_THRESH] = 0.84;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT5+(i*0x15)][LCR_THRESH] = 0.76;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT6+(i*0x15)][UCR_THRESH] = 0.84;
-        pim_sensor_threshold[PIM1_SENSOR_34461_VOLT6+(i*0x15)][LCR_THRESH] = 0.76;
+        pim_sensor_threshold[PIM1_SENSOR_34461_VOLT6+(i*0x15)][LCR_THRESH] = 0.61;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT7+(i*0x15)][UCR_THRESH] = 0.84;
-        pim_sensor_threshold[PIM1_SENSOR_34461_VOLT7+(i*0x15)][LCR_THRESH] = 0.76;
+        pim_sensor_threshold[PIM1_SENSOR_34461_VOLT7+(i*0x15)][LCR_THRESH] = 0.61;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT8+(i*0x15)][UCR_THRESH] = 0.84;
-        pim_sensor_threshold[PIM1_SENSOR_34461_VOLT8+(i*0x15)][LCR_THRESH] = 0.76;
+        pim_sensor_threshold[PIM1_SENSOR_34461_VOLT8+(i*0x15)][LCR_THRESH] = 0.61;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT9+(i*0x15)][UCR_THRESH] = 0.84;
-        pim_sensor_threshold[PIM1_SENSOR_34461_VOLT9+(i*0x15)][LCR_THRESH] = 0.76;
+        pim_sensor_threshold[PIM1_SENSOR_34461_VOLT9+(i*0x15)][LCR_THRESH] = 0.61;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT10+(i*0x15)][UCR_THRESH] = 3.465;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT10+(i*0x15)][LCR_THRESH] = 3.135;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT11+(i*0x15)][UCR_THRESH] = 2.625;
@@ -926,6 +943,7 @@ pim_thresh_array_init(uint8_t fru) {
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT16+(i*0x15)][UCR_THRESH] = 100;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT16+(i*0x15)][LCR_THRESH] = -100;
       } else if (type == PIM_TYPE_4DD) {
+        pim_sensor_threshold[PIM1_SENSOR_QSFP_TEMP+i][UCR_THRESH] = 58;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT1+(i*0x15)][UCR_THRESH] = 0.82;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT1+(i*0x15)][LCR_THRESH] = 0.56;
         pim_sensor_threshold[PIM1_SENSOR_34461_VOLT2+(i*0x15)][UCR_THRESH] = 0.864;
@@ -1052,8 +1070,8 @@ pal_set_pim_thresh(uint8_t fru) {
 int
 pal_clear_thresh_value(uint8_t fru) {
   int ret;
-  char fpath[64] = {0};
-  char cmd[128] = {0};
+  char fpath[64];
+  char cmd[128];
   char fruname[16] = {0};
 
   ret = pal_get_fru_name(fru, fruname);
@@ -1062,15 +1080,13 @@ pal_clear_thresh_value(uint8_t fru) {
     return ret;
   }
 
-  memset(fpath, 0, sizeof(fpath));
-  sprintf(fpath, THRESHOLD_BIN, fruname);
-  sprintf(cmd,"rm -rf %s",fpath);
-  system(cmd);
+  snprintf(fpath, sizeof(fpath), THRESHOLD_BIN, fruname);
+  snprintf(cmd, sizeof(cmd), "rm -rf %s",fpath);
+  RUN_SHELL_CMD(cmd);
 
-  memset(fpath, 0, sizeof(fpath));
-  sprintf(fpath, THRESHOLD_RE_FLAG, fruname);
-  sprintf(cmd,"touch %s",fpath);
-  system(cmd);
+  snprintf(fpath, sizeof(fpath), THRESHOLD_RE_FLAG, fruname);
+  snprintf(cmd, sizeof(cmd), "touch %s",fpath);
+  RUN_SHELL_CMD(cmd);
 
   return 0;
 }
@@ -1208,7 +1224,7 @@ int
 pal_get_fru_id(char *str, uint8_t *fru) {
   if (!strcmp(str, "all")) {
     *fru = FRU_ALL;
-  } else if (!strcmp(str, "smb")) {
+  } else if (!strcmp(str, "smb") || !strcmp(str, "bmc")) {
     *fru = FRU_SMB;
   } else if (!strcmp(str, "scm")) {
     *fru = FRU_SCM;
@@ -1920,6 +1936,88 @@ pal_get_cpld_board_rev(int *rev, const char *device) {
 }
 
 int
+pal_get_cpld_fpga_fw_ver(uint8_t fru, const char *device, uint8_t* ver) {
+  int val = -1, bus = 0;
+  char ver_path[PATH_MAX];
+  char sub_ver_path[PATH_MAX];
+
+  switch(fru) {
+    case FRU_SCM:
+      if (!(strncmp(device, "scmcpld", strlen("scmcpld")))) {
+        snprintf(ver_path, sizeof(ver_path), SCMCPLD_PATH_FMT, "cpld_ver");
+        snprintf(sub_ver_path, sizeof(sub_ver_path),
+                 SCMCPLD_PATH_FMT, "cpld_sub_ver");
+      } else {
+        return -1;
+      }
+      break;
+    case FRU_SMB:
+      if (!(strncmp(device, "left_pdbcpld", strlen("left_pdbcpld")))) {
+        snprintf(ver_path, sizeof(ver_path), LEFT_PDBCPLD_PATH_FMT, "cpld_ver");
+        snprintf(sub_ver_path, sizeof(sub_ver_path),
+                 LEFT_PDBCPLD_PATH_FMT, "cpld_sub_ver");
+      } else if (!(strncmp(device, "right_pdbcpld", strlen("right_pdbcpld")))) {
+        snprintf(ver_path, sizeof(ver_path), RIGHT_PDBCPLD_PATH_FMT, "cpld_ver");
+        snprintf(sub_ver_path, sizeof(sub_ver_path),
+                 RIGHT_PDBCPLD_PATH_FMT, "cpld_sub_ver");
+      } else if (!(strncmp(device, "top_fcmcpld", strlen("top_fcmcpld")))) {
+        snprintf(ver_path, sizeof(ver_path), TOP_FCMCPLD_PATH_FMT, "cpld_ver");
+        snprintf(sub_ver_path, sizeof(sub_ver_path),
+                 TOP_FCMCPLD_PATH_FMT, "cpld_sub_ver");
+      } else if (!(strncmp(device, "bottom_fcmcpld", strlen("bottom_fcmcpld")))) {
+        snprintf(ver_path, sizeof(ver_path), BOTTOM_FCMCPLD_PATH_FMT, "cpld_ver");
+        snprintf(sub_ver_path, sizeof(sub_ver_path),
+                 BOTTOM_FCMCPLD_PATH_FMT, "cpld_sub_ver");
+      } else if (!(strncmp(device, "smbcpld", strlen("smbcpld")))) {
+        snprintf(ver_path, sizeof(ver_path), SMBCPLD_PATH_FMT, "cpld_ver");
+        snprintf(sub_ver_path, sizeof(sub_ver_path),
+                 SMBCPLD_PATH_FMT, "cpld_sub_ver");
+      } else if (!(strncmp(device, "iobfpga", strlen("iobfpga")))) {
+        snprintf(ver_path, sizeof(ver_path), IOBFPGA_PATH_FMT, "fpga_ver");
+        snprintf(sub_ver_path, sizeof(sub_ver_path),
+                IOBFPGA_PATH_FMT, "fpga_sub_ver");
+      } else {
+        return -1;
+      }
+      break;
+    case FRU_PIM1:
+    case FRU_PIM2:
+    case FRU_PIM3:
+    case FRU_PIM4:
+    case FRU_PIM5:
+    case FRU_PIM6:
+    case FRU_PIM7:
+    case FRU_PIM8:
+      bus = ((fru - FRU_PIM1) * 8) + 80;
+      if (!(strncmp(device, "domfpga", strlen("domfpga")))) {
+        snprintf(ver_path, sizeof(ver_path),
+                 I2C_SYSFS_DEVICES"/%d-0060/fpga_ver", bus);
+        snprintf(sub_ver_path, sizeof(sub_ver_path),
+                 I2C_SYSFS_DEVICES"/%d-0060/fpga_sub_ver", bus);
+      } else {
+        return -1;
+      }
+      break;
+     default:
+      return -1;
+  }
+
+  if (!read_device(ver_path, &val)) {
+    ver[0] = (uint8_t)val;
+  } else {
+    return -1;
+  }
+
+  if (!read_device(sub_ver_path, &val)) {
+    ver[1] = (uint8_t)val;
+  } else {
+    return -1;
+  }
+
+  return 0;
+}
+
+int
 pal_set_last_pwr_state(uint8_t fru, char *state) {
 
   int ret;
@@ -1969,6 +2067,22 @@ pal_set_com_pwr_btn_n(char *status) {
   return 0;
 }
 
+int
+pal_get_com_pwr_btn_n(void) {
+  int ret;
+  int val;
+  ret = read_device(SCM_COM_PWR_BTN, &val);
+  if (ret) {
+#ifdef DEBUG
+  syslog(LOG_WARNING, "read_device failed for %s\n", SCM_COM_PWR_BTN);
+#endif
+    return -1;
+  }
+
+  return val;
+}
+
+
 static bool
 is_server_on(void) {
   int ret;
@@ -1992,18 +2106,29 @@ server_power_on(void) {
     if (pal_set_com_pwr_btn_n("1")) {
       return -1;
     }
+    sleep(1);
+    if (pal_get_com_pwr_btn_n() != 1){
+        syslog(LOG_WARNING, "%s: Failed to write to com_pwr_btn_n", __func__);
+        return -1;
+    }
 
     if (pal_set_com_pwr_btn_n("0")) {
       return -1;
     }
     sleep(1);
-
+    if (pal_get_com_pwr_btn_n() != 0){
+        syslog(LOG_WARNING, "%s: Failed to write to com_pwr_btn_n", __func__);
+        return -1;
+    }
     if (pal_set_com_pwr_btn_n("1")) {
       return -1;
     }
     /* Wait for server power good ready */
     sleep(1);
-
+    if (pal_get_com_pwr_btn_n() != 1){
+        syslog(LOG_WARNING, "%s: Failed to write to com_pwr_btn_n", __func__);
+        return -1;
+    }
     if (!is_server_on()) {
       return -1;
     }
@@ -2022,17 +2147,24 @@ server_power_on(void) {
 static int
 server_power_off(bool gs_flag) {
   int ret;
-
   if (gs_flag) {
     ret = pal_set_com_pwr_btn_n("0");
     if (ret) {
       return -1;
     }
     sleep(DELAY_GRACEFUL_SHUTDOWN);
-
+    if (pal_get_com_pwr_btn_n() != 0){
+        syslog(LOG_WARNING, "%s: Failed to write to com_pwr_btn_n", __func__);
+        return -1;
+    }
     ret = pal_set_com_pwr_btn_n("1");
     if (ret) {
       return -1;
+    }
+    sleep(1);
+    if (pal_get_com_pwr_btn_n() != 1){
+        syslog(LOG_WARNING, "%s: Failed to write to com_pwr_btn_n", __func__);
+        return -1;
     }
   } else {
     ret = write_device(SCM_COM_PWR_ENBLE, "0");
@@ -2167,25 +2299,27 @@ static int
 get_current_dir(const char *device, char *dir_name) {
   char cmd[LARGEST_DEVICE_NAME + 1];
   FILE *fp;
-  int ret=-1;
   int size;
 
   // Get current working directory
-  snprintf(
-      cmd, LARGEST_DEVICE_NAME, "cd %s;pwd", device);
+  snprintf(cmd, sizeof(cmd), "cd %s;pwd", device);
 
   fp = popen(cmd, "r");
   if(NULL == fp)
      return -1;
-  fgets(dir_name, LARGEST_DEVICE_NAME, fp);
 
-  ret = pclose(fp);
-  if(-1 == ret)
-     syslog(LOG_ERR, "%s pclose() fail ", __func__);
+  if (fgets(dir_name, LARGEST_DEVICE_NAME, fp) == NULL) {
+    pclose(fp);
+    return -1;
+  }
+
+  if (pclose(fp) == -1)
+     OBMC_ERROR(errno, "pclose(%s) failed", cmd);
 
   // Remove the newline character at the end
   size = strlen(dir_name);
-  dir_name[size-1] = '\0';
+  if (size > 0 && isspace(dir_name[size - 1]))
+    dir_name[size - 1] = '\0';
 
   return 0;
 }
@@ -2232,6 +2366,33 @@ read_attr(uint8_t fru, uint8_t snr_num, const char *device,
   return 0;
 }
 
+/*
+ * Determine extra divisor of hotswap power output
+ * - kernel 4.1.x:
+ *   pmbus_core.c use milliwatt for direct format power output,
+ *   thus we keep hsc_power_div equal to 1.
+ * - Higher kernel versions:
+ *   pmbus_core.c use microwatt for direct format power output,
+ *   thus we need to set hsc_power_div equal to 1000.
+ */
+static int
+hsc_power_div_init(void) {
+  k_version_t kernel_ver;
+
+  kernel_ver = get_kernel_version();
+
+  if (kernel_ver != 0) {
+    if (kernel_ver < KERNEL_VERSION(4, 2, 0))
+      hsc_power_div = 1;
+    else
+      hsc_power_div = 1000;
+  } else {
+    return -1;
+  }
+
+  return 0;
+}
+
 static int
 read_hsc_attr(uint8_t fru, uint8_t snr_num, const char *device,
               const char* attr, float r_sense, float *value) {
@@ -2260,7 +2421,18 @@ read_hsc_curr(uint8_t fru, uint8_t snr_num,
 static int
 read_hsc_power(uint8_t fru, uint8_t snr_num,
                const char *device, float r_sense, float *value) {
-  return read_hsc_attr(fru, snr_num, device, POWER(1), r_sense, value);
+  int ret = -1;
+  static bool hsc_power_div_inited = false;
+
+  if (!hsc_power_div_inited && !hsc_power_div_init()) {
+    hsc_power_div_inited = true;
+  }
+
+  ret = read_hsc_attr(fru, snr_num, device, POWER(1), r_sense, value);
+  if (!ret)
+    *value = *value / hsc_power_div;
+
+  return ret;
 }
 
 static int
@@ -2666,25 +2838,32 @@ hsc_rsense_init(uint8_t hsc_id, const char* device) {
 
   if (!rsense_inited[hsc_id]) {
     int brd_rev = -1;
-
-    switch (hsc_id) {
-      case HSC_FCM_T:
-        pal_get_cpld_board_rev(&brd_rev, device);
-        /* R0D or R0E FCM */
-        if (brd_rev == 0x4 || brd_rev == 0x5) {
-          hsc_rsense[hsc_id] = 1.14;
-        } else {
-          hsc_rsense[hsc_id] = 0.33;
-        }
+    /*
+     * Config FCM Rsense value at different hardware version.
+     * Kernel driver use Rsense equal to 1 milliohm. We need to correct Rsense
+     * value, and all values are from hardware team.
+     */
+    pal_get_cpld_board_rev(&brd_rev, device);
+    switch (brd_rev) {
+      case 0x7:
+      case 0x2:
+        /* R0A, R0B or R0C FCM */
+        hsc_rsense[hsc_id] = 0.33;
         break;
-      case HSC_FCM_B:
-        pal_get_cpld_board_rev(&brd_rev, device);
-        /* R0D or R0E FCM */
-        if (brd_rev == 0x4 || brd_rev == 0x5) {
-          hsc_rsense[hsc_id] = 1.15;
-        } else {
-          hsc_rsense[hsc_id] = 0.33;
-        }
+      case 0x4:
+      case 0x5:
+        /* R0D or R01 FCM */
+        if (hsc_id == HSC_FCM_T)
+          hsc_rsense[hsc_id] = 0.377;
+        else
+          hsc_rsense[hsc_id] = 0.376;
+        break;
+      default:
+        /*
+         * Default, keep Rsense to 1, if we have new FCM version,
+         * we can use default Rsense value as a base to correct real value.
+         */
+        hsc_rsense[hsc_id] = 1;
         break;
     }
     rsense_inited[hsc_id] = true;
@@ -3007,18 +3186,30 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       ret = read_hsc_volt(fru, sensor_num, PIM1_HSC_DEVICE, 1, value);
       break;
     case PIM1_SENSOR_HSC_CURR:
-      ret = read_hsc_curr(fru, sensor_num, PIM1_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM1_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM1_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM1_SENSOR_HSC_POWER:
-      ret = read_hsc_power(fru, sensor_num, PIM1_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM1_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM1_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM1_SENSOR_34461_VOLT1:
       ret = read_attr(fru, sensor_num, PIM1_34461_DEVICE, VOLT(1), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 4;
+      if (type == PIM_TYPE_16O)  *value = *value * 4;
       break;
     case PIM1_SENSOR_34461_VOLT2:
       ret = read_attr(fru, sensor_num, PIM1_34461_DEVICE, VOLT(2), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM1_SENSOR_34461_VOLT3:
       ret = read_attr(fru, sensor_num, PIM1_34461_DEVICE, VOLT(3), value);
@@ -3043,11 +3234,11 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       break;
     case PIM1_SENSOR_34461_VOLT10:
       ret = read_attr(fru, sensor_num, PIM1_34461_DEVICE, VOLT(10), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM1_SENSOR_34461_VOLT11:
       ret = read_attr(fru, sensor_num, PIM1_34461_DEVICE, VOLT(11), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM1_SENSOR_34461_VOLT12:
       ret = read_attr(fru, sensor_num, PIM1_34461_DEVICE, VOLT(12), value);
@@ -3077,18 +3268,30 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       ret = read_hsc_volt(fru, sensor_num, PIM2_HSC_DEVICE, 1, value);
       break;
     case PIM2_SENSOR_HSC_CURR:
-      ret = read_hsc_curr(fru, sensor_num, PIM2_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM2_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM2_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM2_SENSOR_HSC_POWER:
-      ret = read_hsc_power(fru, sensor_num, PIM2_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM2_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM2_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM2_SENSOR_34461_VOLT1:
       ret = read_attr(fru, sensor_num, PIM2_34461_DEVICE, VOLT(1), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 4;
+      if (type == PIM_TYPE_16O)  *value = *value * 4;
       break;
     case PIM2_SENSOR_34461_VOLT2:
       ret = read_attr(fru, sensor_num, PIM2_34461_DEVICE, VOLT(2), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM2_SENSOR_34461_VOLT3:
       ret = read_attr(fru, sensor_num, PIM2_34461_DEVICE, VOLT(3), value);
@@ -3113,11 +3316,11 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       break;
     case PIM2_SENSOR_34461_VOLT10:
       ret = read_attr(fru, sensor_num, PIM2_34461_DEVICE, VOLT(10), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM2_SENSOR_34461_VOLT11:
       ret = read_attr(fru, sensor_num, PIM2_34461_DEVICE, VOLT(11), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM2_SENSOR_34461_VOLT12:
       ret = read_attr(fru, sensor_num, PIM2_34461_DEVICE, VOLT(12), value);
@@ -3147,18 +3350,30 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       ret = read_hsc_volt(fru, sensor_num, PIM3_HSC_DEVICE, 1, value);
       break;
     case PIM3_SENSOR_HSC_CURR:
-      ret = read_hsc_curr(fru, sensor_num, PIM3_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM3_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM3_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM3_SENSOR_HSC_POWER:
-      ret = read_hsc_power(fru, sensor_num, PIM3_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM3_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM3_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM3_SENSOR_34461_VOLT1:
       ret = read_attr(fru, sensor_num, PIM3_34461_DEVICE, VOLT(1), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 4;
+      if (type == PIM_TYPE_16O)  *value = *value * 4;
       break;
     case PIM3_SENSOR_34461_VOLT2:
       ret = read_attr(fru, sensor_num, PIM3_34461_DEVICE, VOLT(2), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM3_SENSOR_34461_VOLT3:
       ret = read_attr(fru, sensor_num, PIM3_34461_DEVICE, VOLT(3), value);
@@ -3183,11 +3398,11 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       break;
     case PIM3_SENSOR_34461_VOLT10:
       ret = read_attr(fru, sensor_num, PIM3_34461_DEVICE, VOLT(10), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM3_SENSOR_34461_VOLT11:
       ret = read_attr(fru, sensor_num, PIM3_34461_DEVICE, VOLT(11), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM3_SENSOR_34461_VOLT12:
       ret = read_attr(fru, sensor_num, PIM3_34461_DEVICE, VOLT(12), value);
@@ -3217,18 +3432,30 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       ret = read_hsc_volt(fru, sensor_num, PIM4_HSC_DEVICE, 1, value);
       break;
     case PIM4_SENSOR_HSC_CURR:
-      ret = read_hsc_curr(fru, sensor_num, PIM4_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM4_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM4_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM4_SENSOR_HSC_POWER:
-      ret = read_hsc_power(fru, sensor_num, PIM4_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM4_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM4_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM4_SENSOR_34461_VOLT1:
       ret = read_attr(fru, sensor_num, PIM4_34461_DEVICE, VOLT(1), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 4;
+      if (type == PIM_TYPE_16O)  *value = *value * 4;
       break;
     case PIM4_SENSOR_34461_VOLT2:
       ret = read_attr(fru, sensor_num, PIM4_34461_DEVICE, VOLT(2), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM4_SENSOR_34461_VOLT3:
       ret = read_attr(fru, sensor_num, PIM4_34461_DEVICE, VOLT(3), value);
@@ -3253,11 +3480,11 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       break;
     case PIM4_SENSOR_34461_VOLT10:
       ret = read_attr(fru, sensor_num, PIM4_34461_DEVICE, VOLT(10), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM4_SENSOR_34461_VOLT11:
       ret = read_attr(fru, sensor_num, PIM4_34461_DEVICE, VOLT(11), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM4_SENSOR_34461_VOLT12:
       ret = read_attr(fru, sensor_num, PIM4_34461_DEVICE, VOLT(12), value);
@@ -3287,18 +3514,30 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       ret = read_hsc_volt(fru, sensor_num, PIM5_HSC_DEVICE, 1, value);
       break;
     case PIM5_SENSOR_HSC_CURR:
-      ret = read_hsc_curr(fru, sensor_num, PIM5_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM5_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM5_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM5_SENSOR_HSC_POWER:
-      ret = read_hsc_power(fru, sensor_num, PIM5_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM5_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM5_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM5_SENSOR_34461_VOLT1:
       ret = read_attr(fru, sensor_num, PIM5_34461_DEVICE, VOLT(1), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 4;
+      if (type == PIM_TYPE_16O)  *value = *value * 4;
       break;
     case PIM5_SENSOR_34461_VOLT2:
       ret = read_attr(fru, sensor_num, PIM5_34461_DEVICE, VOLT(2), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM5_SENSOR_34461_VOLT3:
       ret = read_attr(fru, sensor_num, PIM5_34461_DEVICE, VOLT(3), value);
@@ -3323,11 +3562,11 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       break;
     case PIM5_SENSOR_34461_VOLT10:
       ret = read_attr(fru, sensor_num, PIM5_34461_DEVICE, VOLT(10), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM5_SENSOR_34461_VOLT11:
       ret = read_attr(fru, sensor_num, PIM5_34461_DEVICE, VOLT(11), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM5_SENSOR_34461_VOLT12:
       ret = read_attr(fru, sensor_num, PIM5_34461_DEVICE, VOLT(12), value);
@@ -3357,18 +3596,30 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       ret = read_hsc_volt(fru, sensor_num, PIM6_HSC_DEVICE, 1, value);
       break;
     case PIM6_SENSOR_HSC_CURR:
-      ret = read_hsc_curr(fru, sensor_num, PIM6_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM6_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM6_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM6_SENSOR_HSC_POWER:
-      ret = read_hsc_power(fru, sensor_num, PIM6_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM6_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM6_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM6_SENSOR_34461_VOLT1:
       ret = read_attr(fru, sensor_num, PIM6_34461_DEVICE, VOLT(1), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 4;
+      if (type == PIM_TYPE_16O)  *value = *value * 4;
       break;
     case PIM6_SENSOR_34461_VOLT2:
       ret = read_attr(fru, sensor_num, PIM6_34461_DEVICE, VOLT(2), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM6_SENSOR_34461_VOLT3:
       ret = read_attr(fru, sensor_num, PIM6_34461_DEVICE, VOLT(3), value);
@@ -3393,11 +3644,11 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       break;
     case PIM6_SENSOR_34461_VOLT10:
       ret = read_attr(fru, sensor_num, PIM6_34461_DEVICE, VOLT(10), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM6_SENSOR_34461_VOLT11:
       ret = read_attr(fru, sensor_num, PIM6_34461_DEVICE, VOLT(11), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM6_SENSOR_34461_VOLT12:
       ret = read_attr(fru, sensor_num, PIM6_34461_DEVICE, VOLT(12), value);
@@ -3427,18 +3678,30 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       ret = read_hsc_volt(fru, sensor_num, PIM7_HSC_DEVICE, 1, value);
       break;
     case PIM7_SENSOR_HSC_CURR:
-      ret = read_hsc_curr(fru, sensor_num, PIM7_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM7_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM7_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM7_SENSOR_HSC_POWER:
-      ret = read_hsc_power(fru, sensor_num, PIM7_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM7_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM7_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM7_SENSOR_34461_VOLT1:
       ret = read_attr(fru, sensor_num, PIM7_34461_DEVICE, VOLT(1), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 4;
+      if (type == PIM_TYPE_16O)  *value = *value * 4;
       break;
     case PIM7_SENSOR_34461_VOLT2:
       ret = read_attr(fru, sensor_num, PIM7_34461_DEVICE, VOLT(2), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM7_SENSOR_34461_VOLT3:
       ret = read_attr(fru, sensor_num, PIM7_34461_DEVICE, VOLT(3), value);
@@ -3463,11 +3726,11 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       break;
     case PIM7_SENSOR_34461_VOLT10:
       ret = read_attr(fru, sensor_num, PIM7_34461_DEVICE, VOLT(10), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM7_SENSOR_34461_VOLT11:
       ret = read_attr(fru, sensor_num, PIM7_34461_DEVICE, VOLT(11), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM7_SENSOR_34461_VOLT12:
       ret = read_attr(fru, sensor_num, PIM7_34461_DEVICE, VOLT(12), value);
@@ -3497,18 +3760,30 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       ret = read_hsc_volt(fru, sensor_num, PIM8_HSC_DEVICE, 1, value);
       break;
     case PIM8_SENSOR_HSC_CURR:
-      ret = read_hsc_curr(fru, sensor_num, PIM8_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM8_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_curr(fru, sensor_num,
+                            PIM8_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM8_SENSOR_HSC_POWER:
-      ret = read_hsc_power(fru, sensor_num, PIM8_HSC_DEVICE, PIM_RSENSE, value);
+      if (type == PIM_TYPE_16O) {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM8_HSC_DEVICE, PIM16O_RSENSE, value);
+      } else {
+        ret = read_hsc_power(fru, sensor_num,
+                             PIM8_HSC_DEVICE, PIM_RSENSE, value);
+      }
       break;
     case PIM8_SENSOR_34461_VOLT1:
       ret = read_attr(fru, sensor_num, PIM8_34461_DEVICE, VOLT(1), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 4;
+      if (type == PIM_TYPE_16O)  *value = *value * 4;
       break;
     case PIM8_SENSOR_34461_VOLT2:
       ret = read_attr(fru, sensor_num, PIM8_34461_DEVICE, VOLT(2), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM8_SENSOR_34461_VOLT3:
       ret = read_attr(fru, sensor_num, PIM8_34461_DEVICE, VOLT(3), value);
@@ -3533,11 +3808,11 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
       break;
     case PIM8_SENSOR_34461_VOLT10:
       ret = read_attr(fru, sensor_num, PIM8_34461_DEVICE, VOLT(10), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM8_SENSOR_34461_VOLT11:
       ret = read_attr(fru, sensor_num, PIM8_34461_DEVICE, VOLT(11), value);
-      if(type == PIM_TYPE_16O)  *value = *value * 2;
+      if (type == PIM_TYPE_16O)  *value = *value * 2;
       break;
     case PIM8_SENSOR_34461_VOLT12:
       ret = read_attr(fru, sensor_num, PIM8_34461_DEVICE, VOLT(12), value);
@@ -3563,11 +3838,15 @@ pim_sensor_read(uint8_t fru, uint8_t sensor_num, float *value) {
 
 static int
 psu_init_acok_key(uint8_t fru) {
-  uint8_t psu_num = fru - 10;
+  uint8_t psu_num;
   char key[MAX_KEY_LEN + 1];
 
-  snprintf(key, MAX_KEY_LEN, "psu%d_acok_state", psu_num);
-  kv_set(key, "1", 0, KV_FCREATE);
+  if ((fru >= FRU_PSU1) && (fru <= FRU_PSU4)) {
+    psu_num = (fru - FRU_PSU1 + 1); /* 1-based index */
+
+    snprintf(key, MAX_KEY_LEN, "psu%d_acok_state", psu_num);
+    kv_set(key, "1", 0, KV_FCREATE);
+  }
 
   return 0;
 }
@@ -5563,34 +5842,6 @@ pal_get_sensor_threshold(uint8_t fru, uint8_t sensor_num,
   return 0;
 }
 
-bool
-pal_is_fw_update_ongoing(uint8_t fru) {
-
-  char key[MAX_KEY_LEN];
-  char value[MAX_VALUE_LEN] = {0};
-  int ret;
-  struct timespec ts;
-
-  switch (fru) {
-    case FRU_SCM:
-      sprintf(key, "slot%d_fwupd", IPMB_BUS);
-      break;
-    default:
-      return false;
-  }
-
-  ret = kv_get(key, value, NULL, 0);
-  if (ret < 0) {
-     return false;
-  }
-
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  if (strtoul(value, NULL, 10) > ts.tv_sec)
-     return true;
-
-  return false;
-}
-
 int
 pal_get_fw_info(uint8_t fru, unsigned char target,
                 unsigned char* res, unsigned char* res_len) {
@@ -6339,18 +6590,16 @@ generate_dump(void *arg) {
 
   pal_get_fru_name(fru, fruname);//scm
 
-  memset(fname, 0, sizeof(fname));
-  snprintf(fname, 128, "/var/run/autodump%d.pid", fru);
+  snprintf(fname, sizeof(fname), "/var/run/autodump%d.pid", fru);
   if (access(fname, F_OK) == 0) {
-    memset(cmd, 0, sizeof(cmd));
-    sprintf(cmd,"rm %s",fname);
-    system(cmd);
+    if (unlink(fname) != 0) {
+      OBMC_ERROR(errno, "failed to delete %s", fname);
+    }
   }
 
   // Execute automatic crashdump
-  memset(cmd, 0, 128);
-  sprintf(cmd, "%s %s", CRASHDUMP_BIN, fruname);
-  system(cmd);
+  snprintf(cmd, sizeof(cmd), "%s %s", CRASHDUMP_BIN, fruname);
+  RUN_SHELL_CMD(cmd);
 
   syslog(LOG_CRIT, "Crashdump for FRU: %d is generated.", fru);
 
@@ -6380,14 +6629,14 @@ pal_store_crashdump(uint8_t fru) {
              "pal_store_crashdump: No Crashdump pthread exists");
     } else {
       pthread_join(t_dump[fru-1].pt, NULL);
-      sprintf(cmd,
+      snprintf(cmd, sizeof(cmd),
               "ps | grep '{dump.sh}' | grep 'scm' "
               "| awk '{print $1}'| xargs kill");
-      system(cmd);
-      sprintf(cmd,
+      RUN_SHELL_CMD(cmd);
+      snprintf(cmd, sizeof(cmd),
               "ps | grep 'bic-util' | grep 'scm' "
               "| awk '{print $1}'| xargs kill");
-      system(cmd);
+      RUN_SHELL_CMD(cmd);
 #ifdef DEBUG
       syslog(LOG_INFO, "pal_store_crashdump:"
                        " Previous crashdump thread is cancelled");
@@ -7370,9 +7619,8 @@ pal_get_boot_order(uint8_t slot, uint8_t *req_data,
 int
 pal_set_boot_order(uint8_t slot, uint8_t *boot,
                    uint8_t *res_data, uint8_t *res_len) {
-  int i, j, network_dev = 0;
+  int i, j, offset, network_dev = 0;
   char str[MAX_VALUE_LEN] = {0};
-  char tstr[10];
   enum {
     BOOT_DEVICE_IPV4 = 0x1,
     BOOT_DEVICE_IPV6 = 0x9,
@@ -7380,7 +7628,7 @@ pal_set_boot_order(uint8_t slot, uint8_t *boot,
 
   *res_len = 0;
 
-  for (i = 0; i < SIZE_BOOT_ORDER; i++) {
+  for (i = offset = 0; i < SIZE_BOOT_ORDER && offset < sizeof(str); i++) {
     if (i > 0) {  // byte[0] is boot mode, byte[1:5] are boot order
       for (j = i+1; j < SIZE_BOOT_ORDER; j++) {
         if (boot[i] == boot[j])
@@ -7394,8 +7642,7 @@ pal_set_boot_order(uint8_t slot, uint8_t *boot,
         network_dev++;
     }
 
-    snprintf(tstr, 3, "%02x", boot[i]);
-    strncat(str, tstr, 3);
+    offset += snprintf(str + offset, sizeof(str) - offset, "%02x", boot[i]);
   }
 
   // not allow having more than 1 network boot device in the boot order
@@ -7505,4 +7752,29 @@ pal_is_mcu_working(void) {
   }
 
   return false;
+}
+
+int
+pal_is_slot_server(uint8_t fru) {
+  if (fru == FRU_SCM) {
+    return 1;
+  }
+  return 0;
+}
+
+int
+pal_parse_oem_sel(uint8_t fru, uint8_t *sel, char *error_log)
+{
+  char crisel[128];
+  uint8_t mfg_id[] = {0x4c, 0x1c, 0x00};
+
+  error_log[0] = '\0';
+
+  // Record Type: 0xC0 (OEM)
+  if ((sel[2] == 0xC0) && !memcmp(&sel[7], mfg_id, sizeof(mfg_id))) {
+    snprintf(crisel, sizeof(crisel), "Slot %u PCIe err,FRU:%u", sel[14], fru);
+    pal_add_cri_sel(crisel);
+  }
+
+  return 0;
 }

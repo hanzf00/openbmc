@@ -15,6 +15,8 @@
 
 using namespace std;
 
+#ifdef __TEST__
+
 // TODO Mocks are yet to be written
 
 int System::runcmd(const string &cmd)
@@ -40,7 +42,7 @@ int System::vboot_support_status(void)
   return VBOOT_NO_ENFORCE;
 }
 
-bool System::get_mtd_name(string name, string &dev)
+bool System::get_mtd_name(string name, string &dev, size_t& size, size_t& erasesize)
 {
   map<string, string> mtd_map = {
     {"flash0", "/dev/mtd5"},
@@ -55,6 +57,8 @@ bool System::get_mtd_name(string name, string &dev)
   if (mtd_map.find(name) == mtd_map.end())
     return false;
   dev = mtd_map[name];
+  size = 512 * 1024;
+  erasesize = 64 * 1024;
   return true;
 }
 
@@ -83,11 +87,13 @@ uint8_t System::get_fru_id(string &name)
   return atoi(env);
 }
 
-string System::lock_file(string &name)
-{
-  return "./fw-util-" + name + ".lock";
-}
-
 void System::set_update_ongoing(uint8_t fru_id, int timeo)
 {
 }
+
+bool System::is_update_ongoing(uint8_t fru_id)
+{
+  return false;
+}
+
+#endif

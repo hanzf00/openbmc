@@ -24,9 +24,15 @@ LIC_FILES_CHKSUM = "file://COPYING;md5=eb723b61539feef013de476e68b5c50a"
 SRC_URI = "file://ast-functions \
            file://sol-util \
            file://setup-gpio.sh \
+           file://setup_i2c.sh \
            file://sync_date.sh \
            file://setup-por.sh \
-           file://setup-emmc.sh \
+           file://setup-usbhub.sh \
+           file://setup-cmc.sh \
+           file://setup-bridge.sh \
+           file://run-bridge.sh \
+           file://eth0_mac_fixup.sh \
+           file://run-ipv4-fix.sh \
            file://COPYING \
           "
 
@@ -56,12 +62,22 @@ do_install() {
   install -d ${D}${sysconfdir}/rcS.d
   install -m 755 setup-gpio.sh ${D}${sysconfdir}/init.d/setup-gpio.sh
   update-rc.d -r ${D} setup-gpio.sh start 59 5 .
+  install -m 755 setup_i2c.sh ${D}${sysconfdir}/init.d/setup_i2c.sh
+  update-rc.d -r ${D} setup_i2c.sh start 60 5 .
   install -m 755 sync_date.sh ${D}${sysconfdir}/init.d/sync_date.sh
   update-rc.d -r ${D} sync_date.sh start 66 5 .
+  install -m 755 setup-cmc.sh ${D}${sysconfdir}/init.d/setup-cmc.sh
+  update-rc.d -r ${D} setup-cmc.sh start 67 5 .
+  install -m 755 eth0_mac_fixup.sh ${D}${sysconfdir}/init.d/eth0_mac_fixup.sh
+  install -m 755 run-ipv4-fix.sh ${D}${sysconfdir}/init.d/run-ipv4-fix.sh
+  update-rc.d -r ${D} run-ipv4-fix.sh start 71 5 .
   install -m 755 setup-por.sh ${D}${sysconfdir}/init.d/setup-por.sh
   update-rc.d -r ${D} setup-por.sh start 70 S .
-  install -m 755 setup-emmc.sh ${D}${sysconfdir}/init.d/setup-emmc.sh
-  update-rc.d -r ${D} setup-emmc.sh start 05 S .
+  install -m 755 setup-usbhub.sh ${D}${sysconfdir}/init.d/setup-usbhub.sh
+  update-rc.d -r ${D} setup-usbhub.sh start 90 S .
+  install -m 755 setup-bridge.sh ${D}${sysconfdir}/init.d/setup-bridge.sh
+  install -m 755 run-bridge.sh ${D}${sysconfdir}/init.d/run-bridge.sh
+  update-rc.d -r ${D} run-bridge.sh start 99 5 .
 }
 
 FILES_${PN} += "/usr/local ${sysconfdir}"

@@ -45,9 +45,9 @@ OPENBMC_GPIO_SOC_TABLE = "soc_gpio_table.py"
 
 inherit distutils3
 
-DEPENDS_${PN} = "python3 python3-distribute update-rc.d-native"
+DEPENDS = "python3 python3-setuptools update-rc.d-native"
 
-RDEPENDS_${PN} = "python3-core python3-argparse python3-subprocess"
+RDEPENDS_${PN} = "python3-core"
 
 do_board_defined_soc_table() {
     if [ "${OPENBMC_GPIO_SOC_TABLE}" != "soc_gpio_table.py" ]; then

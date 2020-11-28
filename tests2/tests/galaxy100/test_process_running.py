@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2018-present Facebook. All Rights Reserved.
 #
@@ -24,4 +24,4 @@ from common.base_process_running_test import BaseProcessRunningTest
 
 class ProcessRunningTest(BaseProcessRunningTest, unittest.TestCase):
     def set_processes(self):
-        self.expected_process = ["spatula_wrapper.py", "sshd", "rsyslogd", "restapi"]
+        self.expected_process = ["spatula_wrapper.py", "sshd", "rsyslogd", "rest.py"]

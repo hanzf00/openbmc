@@ -31,9 +31,17 @@
 . /usr/local/fbpackages/utils/ast-functions
 
 SPB_FRU_FILE="/tmp/fruid_spb.bin"
-SPB_TYPE="/tmp/spb_type"
 
 echo "Starting IPMB Rx/Tx Daemon"
+
+kernel_ver=$(get_kernel_ver)
+if [ $kernel_ver == 5 ]; then
+  echo slave-mqueue 0x1010 > /sys/bus/i2c/devices/i2c-1/new_device
+  echo slave-mqueue 0x1010 > /sys/bus/i2c/devices/i2c-3/new_device
+  echo slave-mqueue 0x1010 > /sys/bus/i2c/devices/i2c-5/new_device
+  echo slave-mqueue 0x1010 > /sys/bus/i2c/devices/i2c-7/new_device
+  echo slave-mqueue 0x1010 > /sys/bus/i2c/devices/i2c-13/new_device
+fi
 
 ulimit -q 1024000
 runsv /etc/sv/ipmbd_1 > /dev/null 2>&1 &
@@ -68,17 +76,6 @@ if [[ $(is_server_prsnt 4) == "1" && $(get_slot_type 4) != "0" && $(get_slot_typ
   sv stop ipmbd_7
 elif [ $(is_server_prsnt 4) == "0" ]; then
   sv stop ipmbd_7
-fi
-
-if [ -f $SPB_FRU_FILE ]; then
-  str=$(/usr/local/bin/fruid-util spb | grep -i "Robinson Creek")
-  if [ "$str" != "" ]; then    #RC Baseboard
-    echo 1 > $SPB_TYPE
-  else
-    echo 0 > $SPB_TYPE
-  fi
-else
-  echo 0 > $SPB_TYPE
 fi
 
 runsv /etc/sv/ipmbd_13 > /dev/null 2>&1 &

@@ -42,7 +42,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "SoftwareJTAGHandler.h"
 #include <syslog.h>
 #include <sys/mman.h>
-#include <openbmc/gpio.h>
+#include <openbmc/libgpio.h>
 #include <openbmc/pal.h>
 
 // Enable to print IR/DR trace to syslog
@@ -63,12 +63,6 @@ typedef enum xfer_mode {
     HW_MODE = 0,
     SW_MODE
 } xfer_mode;
-
-struct tck_bitbang {
-    unsigned char     tms;
-    unsigned char     tdi;        // TDI bit value to write
-    unsigned char     tdo;        // TDO bit value to read
-};
 
 struct scan_xfer {
     xfer_mode        mode;        // Hardware or software mode
@@ -187,66 +181,72 @@ STATUS JTAG_set_cntlr_mode(JTAG_Handler* state, const JTAGDriverState setMode)
 
 static STATUS JTAG_set_target(int target)
 {
-    gpio_value_en expected_value;
-    gpio_st gpio;
+    gpio_value_t expected_value, value = GPIO_VALUE_INVALID;
+    gpio_desc_t *gpio;
     STATUS ret = ST_ERR;
 
     /* Change GPIOY2 to have the JTAG master communicating
      * to the CPU instead of CPLD */
-    if (gpio_open(&gpio, gpio_num("GPIOY2"))) {
+    if (NULL == (gpio = gpio_open_by_shadow("BMC_JTAG_SEL"))) {
       syslog(LOG_ERR, "Failed to open GPIOY2\n");
       return ST_ERR;
     }
 
-    if (gpio_change_direction(&gpio, GPIO_DIRECTION_OUT)) {
+    if (gpio_set_direction(gpio, GPIO_DIRECTION_OUT)) {
       syslog(LOG_ERR, "Failed to set GPIOY2 as an output\n");
       goto bail;
     }
 
     if (target == JTAG_TARGET_CPU) {
       // Set internal strap.
-      system("devmem 0x1E6E207C w 0x80000");
+      if (system("devmem 0x1E6E207C w 0x80000") != 0) {
+        syslog(LOG_ERR, "Failed to set Strap\n");
+        goto bail;
+      }
       expected_value = GPIO_VALUE_LOW;
     } else {
       expected_value = GPIO_VALUE_HIGH;
     }
 
-    gpio_write(&gpio, expected_value);
-    if (gpio_read(&gpio) != expected_value) {
+    gpio_set_value(gpio, expected_value);
+    gpio_get_value(gpio, &value);
+    if (value != expected_value) {
       syslog(LOG_WARNING, "Writing %d to GPIOY2 failed! ATSD is most probably disabled\n", expected_value);
       goto bail;
     }
     ret = ST_OK;
 bail:
-    gpio_close(&gpio);
+    gpio_close(gpio);
     return ret;
 }
 
 static STATUS JTAG_set_mux(void)
 {
-    gpio_value_en expected_value = GPIO_VALUE_LOW;
-    gpio_st gpio;
+    gpio_value_t expected_value = GPIO_VALUE_LOW;
+    gpio_value_t value = GPIO_VALUE_INVALID;
+    gpio_desc_t *gpio;
     STATUS ret = ST_ERR;
 
-    if (gpio_open(&gpio, gpio_num("GPIOR2"))) {
+    if (NULL == (gpio = gpio_open_by_shadow("BMC_TCK_MUX_SEL"))) {
       syslog(LOG_ERR, "Failed to open GPIOR2\n");
       return ST_ERR;
     }
 
-    if (gpio_change_direction(&gpio, GPIO_DIRECTION_OUT)) {
+    if (gpio_set_direction(gpio, GPIO_DIRECTION_OUT)) {
       syslog(LOG_ERR, "Failed to set GPIOR2 as an output\n");
       goto bail;
     }
 
     // TODO Does this need to be switched?
-    gpio_write(&gpio, expected_value);
-    if (gpio_read(&gpio) != expected_value) {
+    gpio_set_value(gpio, expected_value);
+    gpio_get_value(gpio, &value);
+    if (value != expected_value) {
       syslog(LOG_WARNING, "Writing %d to GPIOR2 failed! ATSD is most probably disabled\n", expected_value);
       goto bail;
     }
     ret = ST_OK;
 bail:
-    gpio_close(&gpio);
+    gpio_close(gpio);
     return ret;
 
 }

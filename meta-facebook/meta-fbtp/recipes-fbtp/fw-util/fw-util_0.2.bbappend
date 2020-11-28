@@ -20,12 +20,15 @@ FILESEXTRAPATHS_prepend := "${THISDIR}/files:"
 SRC_URI += "file://vr.cpp \
             file://platform.cpp \
             file://cpld.cpp \
+            file://bios.h \
             file://bios.cpp \
+            file://mcu_fw.h \
+            file://mcu_fw.cpp \
             file://usbdbg.cpp \
             file://usbdbg.h \
             file://me.cpp \
            "
 
-DEPENDS += "libgpio libme libcpld libbios libocpdbg-lcd libvr"
-RDEPENDS_${PN} += "libgpio libme libcpld libbios libocpdbg-lcd libvr"
-LDFLAGS += " -lgpio -lme -lcpld -lbios -locpdbg-lcd -lvr"
+DEPENDS += "libgpio libme libfpga libmcu libvr libmisc-utils"
+RDEPENDS_${PN} += "libgpio libme libfpga libmcu libvr libmisc-utils"
+LDFLAGS += " -lgpio -lme -lfpga -lmcu -lvr -lmisc-utils"

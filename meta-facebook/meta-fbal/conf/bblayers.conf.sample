@@ -12,11 +12,13 @@ BBLAYERS ?= " \
   ##OEROOT##/../meta-openembedded/meta-oe \
   ##OEROOT##/../meta-openembedded/meta-networking \
   ##OEROOT##/../meta-openembedded/meta-python \
+  ##OEROOT##/../meta-security/meta-tpm \
   ##OEROOT##/../../.. \
   ##OEROOT##/../../../meta-aspeed \
   ##OEROOT##/../../../meta-facebook \
   ##OEROOT##/../../../meta-facebook/meta-fbal \
   ##OEROOT##/../../../meta-facebook/meta-python3 \
+  ##OEROOT##/../../../meta-facebook/meta-backports \
   "
 BBLAYERS_NON_REMOVABLE ?= " \
   ##OEROOT##/meta \

@@ -4,9 +4,6 @@ inherit kernel_fitimage
 
 require recipes-core/images/fb-openbmc-image.bb
 
-# Changing the image compression from gz to lzma achieves 30% saving (~3M).
-IMAGE_FSTYPES += "cpio.lzma.u-boot"
-
 # Include modules in rootfs
 IMAGE_INSTALL += " \
   packagegroup-openbmc-base \
@@ -33,20 +30,11 @@ IMAGE_INSTALL += " \
   psumuxmon \
   mterm \
   spatula \
-  trousers \
-  tpm-tools \
   fscd  \
+  recover-from-secondary \
+  udev-rules \
   "
 
-IMAGE_FEATURES += " \
-  ssh-server-openssh \
-  tools-debug \
-  "
-
-DISTRO_FEATURES += " \
-  ext2 \
-  ipv6 \
-  nfs \
-  usbgadget \
-  usbhost \
-  "
+IMAGE_INSTALL += "${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'systemd-networkd', '', d)}"
+IMAGE_INSTALL_remove += "${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'init-ifupdown', '', d)}"
+SYSVINIT_SCRIPTS_remove += "${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'init-ifupdown', '', d)}"

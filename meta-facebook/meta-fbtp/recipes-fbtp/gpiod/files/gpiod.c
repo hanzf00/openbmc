@@ -33,7 +33,7 @@
 #include <sys/file.h>
 #include <openbmc/pal.h>
 #include <openbmc/libgpio.h>
-#include <openbmc/ocp-dbg-lcd.h>
+#include <openbmc/mcu.h>
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
 
@@ -122,7 +122,7 @@ delay_log(void *arg)
 
   if (arg) {
     usleep(log->usec);
-    syslog(LOG_CRIT, log->msg);
+    syslog(LOG_CRIT, "%s", log->msg);
 
     free(arg);
   }
@@ -169,8 +169,8 @@ static void usb_debug_card_check_hotfix(gpiopoll_pin_t *desc, gpio_value_t last,
   }
 
   if (odm_id == 0 && board_rev <= BOARD_REV_DVT) {
-    if(value == GPIO_VALUE_HIGH)
-      usb_dbg_reset();
+    if (value == GPIO_VALUE_HIGH)
+      usb_dbg_reset_ioexp(9, 0x4E);
   }
   log_gpio_change(desc, value, 0);
 }
@@ -268,7 +268,7 @@ static void
   syslog(LOG_WARNING, "[%s][%lu] Timer is started.\n", __func__, pthread_self());
   syslog(LOG_WARNING, "[%s] Get GPIO Num: %d", __func__, pin_num);
 #endif
-  
+
   while(1)
   {
     if (gpio_get_value(gpio, &value)) {
@@ -288,7 +288,7 @@ static void
 #ifdef SMI_DEBUG
     syslog(LOG_WARNING, "[%s][%lu] smi_timeout_count[%d] == smi_timeout_threshold[%d]\n", __func__, pthread_self(), smi_timeout_count, smi_timeout_threshold);
 #endif
-    
+
     if ( smi_timeout_count == smi_timeout_threshold )
     {
       syslog(LOG_CRIT, "ASSERT: GPIOG7-FM_BIOS_SMI_ACTIVE_N\n");
@@ -568,7 +568,7 @@ static void ierr_mcerr_event_log(bool is_caterr, const char *err_type)
 
   sprintf(temp_syslog, "ASSERT: CPU%s %s\n", cpu_str, err_type);
   sprintf(temp_log, "CPU%s %s", cpu_str, err_type);
-  syslog(LOG_CRIT, temp_syslog);
+  syslog(LOG_CRIT, "%s", temp_syslog);
   pal_add_cri_sel(temp_log);
 }
 
@@ -607,7 +607,9 @@ ierr_mcerr_event_handler() {
           CATERR_irq--;
           CATERR_ierr_time_count = 0;
           set_fault_led(true);
-          system("/usr/local/bin/autodump.sh &");
+          if (system("/usr/local/bin/autodump.sh &") != 0) {
+            syslog(LOG_CRIT, "Starting crashdump on CATERR failed\n");
+          }
         } else if (CATERR_irq > 1) {
           while (CATERR_irq > 1) {
             ierr_mcerr_event_log(true, "MCERR/CATERR");
@@ -636,7 +638,9 @@ ierr_mcerr_event_handler() {
           MSMI_irq--;
           MSMI_ierr_time_count = 0;
           set_fault_led(true);
-          system("/usr/local/bin/autodump.sh &");
+          if (system("/usr/local/bin/autodump.sh &") != 0) {
+            syslog(LOG_CRIT, "Starting crashdump on MCERR failed\n");
+          }
         } else if (MSMI_irq > 1) {
           while (MSMI_irq > 1) {
             ierr_mcerr_event_log(false, "MCERR/MSMI");
@@ -690,7 +694,7 @@ main(int argc, char **argv) {
     {
       syslog(LOG_WARNING, "pthread_create for smi_handler fail\n");
       exit(1);
-    }   
+    }
 
     polldesc = gpio_poll_open(g_gpios, sizeof(g_gpios)/sizeof(g_gpios[0]));
     if (!polldesc) {

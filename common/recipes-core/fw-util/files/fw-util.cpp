@@ -27,18 +27,24 @@
 #include <sys/file.h>
 #include <map>
 #include <tuple>
+#include <signal.h>
+#include <syslog.h>
+#include <atomic>
+#include <openbmc/pal.h>
 #ifdef __TEST__
 #include <gtest/gtest.h>
 #endif
 #include "fw-util.h"
-
+#include "scheduler.h"
 using namespace std;
 
+std::atomic<bool> quit_process(false);
+
 string exec_name = "Unknown";
-map<string, map<string, Component *>> * Component::fru_list = NULL;
+map<string, map<string, Component *, partialLexCompare>, partialLexCompare> * Component::fru_list = NULL;
 
 Component::Component(string fru, string component)
-  : _fru(fru), _component(component)
+  : _fru(fru), _component(component), sys(), update_initiated(false)
 {
   fru_list_setup();
   (*fru_list)[fru][component] = this;
@@ -50,6 +56,10 @@ Component::~Component()
   if ((*fru_list)[_fru].size() == 0) {
     fru_list->erase(_fru);
   }
+  // Clear the update-ongoing flag if we were the ones
+  // setting it.
+  if (update_initiated)
+    set_update_ongoing(0);
 }
 
 Component *Component::find_component(string fru, string comp)
@@ -112,35 +122,25 @@ int AliasComponent::print_version()
   return _target_comp->print_version();
 }
 
-class ProcessLock {
-  private:
-    string file;
-    int fd;
-    bool _ok;
-  public:
-  ProcessLock(string file) {
-    _ok = false;
-    fd = open(file.c_str(), O_RDWR|O_CREAT, 0666);
-    if (fd < 0) {
-      return;
-    }
-    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
-      close(fd);
-      fd = -1;
-      return;
-    }
-    _ok = true;
-  }
-  ~ProcessLock() {
-    if (_ok) {
-      remove(file.c_str());
-      close(fd);
-    }
-  }
-  bool ok() {
-    return _ok;
-  }
-};
+void AliasComponent::set_update_ongoing(int timeout)
+{
+  if (setup())
+    _target_comp->set_update_ongoing(timeout);
+}
+
+bool AliasComponent::is_update_ongoing()
+{
+  if (!setup())
+    return FW_STATUS_NOT_SUPPORTED;
+  return _target_comp->is_update_ongoing();
+}
+
+void fw_util_sig_handler(int signo)
+{
+  quit_process.store(true);
+  cout << "Terminated requested. Waiting for earlier operation complete.\n";
+  syslog(LOG_DEBUG, "fw_util_sig_handler signo=%d requesting exit", signo);
+}
 
 void usage()
 {
@@ -148,6 +148,10 @@ void usage()
   cout << "       " << exec_name << " FRU --update [--]COMPONENT IMAGE_PATH" << endl;
   cout << "       " << exec_name << " FRU --force --update [--]COMPONENT IMAGE_PATH" << endl;
   cout << "       " << exec_name << " FRU --dump [--]COMPONENT IMAGE_PATH" << endl;
+  cout << "       " << exec_name << " FRU --update COMPONENT IMAGE_PATH --schedule now" << endl;
+  cout << "       " << exec_name << " all --show-schedule" << endl;
+  cout << "       " << exec_name << " all --delete-schedule TASK_ID" << endl;
+  cout << endl;
   cout << left << setw(10) << "FRU" << " : Components" << endl;
   cout << "---------- : ----------" << endl;
   for (auto fkv : *Component::fru_list) {
@@ -156,7 +160,13 @@ void usage()
     for (auto ckv : fkv.second) {
       string comp_name = ckv.first;
       Component *c = ckv.second;
-      cout << comp_name;
+      if (comp_name.find(" ") == comp_name.npos) {
+        // No spaces in the component name, print as-is.
+        cout << comp_name;
+      } else {
+        // Add quotes to ensure there is no confusion from usage.
+        cout << "\"" << comp_name << "\"";
+      }
       if (c->is_alias()) {
         AliasComponent *a = (AliasComponent *)c;
         cout << "(" << a->alias_fru() << ":" << a->alias_component() << ")";
@@ -171,19 +181,14 @@ int main(int argc, char *argv[])
 {
   int ret = 0;
   int find_comp = 0;
+  struct sigaction sa;
 
   Component::fru_list_setup();
 
 #ifdef __TEST__
   testing::InitGoogleTest(&argc, argv);
-  ret = RUN_ALL_TESTS();
-  if (ret != 0) {
-    return ret;
-  }
+  return RUN_ALL_TESTS();
 #endif
-
-  System system;
-
   exec_name = argv[0];
   if (argc < 3) {
     usage();
@@ -194,6 +199,12 @@ int main(int argc, char *argv[])
   string action(argv[2]);
   string component("all");
   string image("");
+  string sub_action("");
+  string time("");
+  string task_id("");
+  json json_array(nullptr);
+  bool add_task = false;
+  Scheduler tasker;
 
   if (action == "--force") {
     if (argc < 4) {
@@ -208,20 +219,36 @@ int main(int argc, char *argv[])
     if (argc >= 5) {
       component.assign(argv[4]);
       if (component.compare(0, 2, "--") == 0) {
+        cerr << "WARNING: Passing component as " << component << " is deprecated" << endl;
         component = component.substr(2);
+        cerr << "         Use: --version|--update " << component << " instead" << endl;
       }
     }
   } else {
     if (argc >= 4) {
       component.assign(argv[3]);
       if (component.compare(0, 2, "--") == 0) {
+        cerr << "WARNING: Passing component as " << component << " is deprecated" << endl;
         component = component.substr(2);
+        cerr << "         Use: --version|--update " << component << " instead" << endl;
+      }
+
+      if ( argc == 7 ) {
+        sub_action.assign(argv[5]);
+        time.assign(argv[6]);
+        if (time != "now") { // only can set time to "now"
+          cerr << "Only can schedule update " << component << " now" << endl;
+          usage();
+          return -1;
+        }
+      } else {
+        task_id.assign(argv[3]);
       }
     }
   }
 
   if ((action == "--update") || (action == "--dump")) {
-    if (argc != 5) {
+    if (argc != 5 && argc != 7 ) {
       usage();
       return -1;
     }
@@ -236,6 +263,15 @@ int main(int argc, char *argv[])
     if (component == "all") {
       cerr << "Upgrading all components not supported" << endl;
       return -1;
+    }
+
+    if ( sub_action.empty() == false ) {
+      if ( sub_action == "--schedule" ) {
+        add_task = true;
+      } else {
+        cerr << "Invalid action: " << sub_action << endl;
+        return -1;
+      }
     }
   } else if (action == "--force") {
     if (argc != 6) {
@@ -257,24 +293,43 @@ int main(int argc, char *argv[])
       usage();
       return -1;
     }
+  } else if (action == "--version-json" ) {
+    json_array = json::array();
+  } else if ( action == "--show-schedule" ) {
+    if (fru != "all") {
+      cerr << "Invalid fru: " <<  fru <<" for showing schedule" << endl;
+      usage();
+      return -1;
+    }
+    return tasker.show_task();
+  } else if ( action == "--delete-schedule" ) {
+    if (fru != "all") {
+      cerr << "Invalid fru: " <<  fru <<" for deleting schedule" << endl;
+      usage();
+      return -1;
+    }
+    return tasker.del_task(task_id);
   } else {
     cerr << "Invalid action: " << action << endl;
     usage();
     return -1;
   }
 
+  sa.sa_handler = fw_util_sig_handler;
+  sa.sa_flags = 0;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGHUP, &sa, NULL);
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGQUIT, &sa, NULL);
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGPIPE, &sa, NULL); // for ssh terminate
+  //print the fw version or do the fw update when the fru and the comp are found
   for (auto fkv : *Component::fru_list) {
     if (fru == "all" || fru == fkv.first) {
-      // Ensure only one instance of fw-util per FRU is running
-      string this_fru(fkv.first);
-      ProcessLock lock(system.lock_file(this_fru));
-      if (!lock.ok()) {
-        cerr << "Another instance of fw-util already running" << endl;
-        return -1;
-      }
-
       for (auto ckv : fkv.second) {
-        if (component == "all" || component == ckv.first) {
+        string comp_name = ckv.first;
+        if (component == "all" || component == comp_name) {
           find_comp = 1;
           Component *c = ckv.second;
 
@@ -287,16 +342,35 @@ int main(int argc, char *argv[])
               continue;
           }
 
+          // We are going to add a task but print fw version
+          // or do fw update.
+          if ( add_task == true ) {
+            return tasker.add_task(fru, component, image, time);
+          }
+
+          if (c->is_update_ongoing()) {
+            cerr << "Upgrade aborted due to ongoing upgrade on FRU: " << c->fru() << endl;
+            return -1;
+          }
+
           if (action == "--version") {
             ret = c->print_version();
             if (ret != FW_STATUS_SUCCESS && ret != FW_STATUS_NOT_SUPPORTED) {
               cerr << "Error getting version of " << c->component()
                 << " on fru: " << c->fru() << endl;
             }
+          } else if ( action == "--version-json" ) {
+            json j_object = {{"FRU", c->fru()}, {"COMPONENT", c->component()}};
+            c->get_version(j_object);
+            json_array.push_back(j_object);
           } else {  // update or dump
+            if (fru == "all") {
+              usage();
+              return -1;
+            }
+
             string str_act("");
-            uint8_t fru_id = system.get_fru_id(c->fru());
-            system.set_update_ongoing(fru_id, 60 * 10);
+            c->set_update_ongoing(60 * 10);
             if (action == "--update") {
               ret = c->update(image);
               str_act.assign("Upgrade");
@@ -307,9 +381,10 @@ int main(int argc, char *argv[])
               ret = c->dump(image);
               str_act.assign("Dump");
             }
-            system.set_update_ongoing(fru_id, 0);
+            c->set_update_ongoing(0);
             if (ret == 0) {
               cout << str_act << " of " << c->fru() << " : " << component << " succeeded" << endl;
+              c->update_finish();
             } else {
               cerr << str_act << " of " << c->fru() << " : " << component;
               if (ret == FW_STATUS_NOT_SUPPORTED) {
@@ -317,15 +392,27 @@ int main(int argc, char *argv[])
               } else {
                 cerr << " failed" << endl;
               }
+              return -1;
             }
+          }
+
+          if (quit_process.load()) {
+            syslog(LOG_DEBUG, "fw-util: Terminate request handled");
+            cout << "Aborted action due to signal\n";
+            return -1;
           }
         }
       }
     }
   }
+
   if (!find_comp) {
     usage();
     return -1;
+  }
+
+  if ( action == "--version-json" ) {
+    cout << json_array.dump(4) << endl;
   }
 
   return 0;

@@ -36,6 +36,9 @@ SRC_URI += "file://bios_util.sh \
             file://seutil \
             file://peutil \
             file://scdinfo \
+            file://psu_show_tech.py \
+            file://show_tech.py \
+            file://sup_eeprom.sh \
            "
 
 OPENBMC_UTILS_FILES += " \
@@ -53,6 +56,8 @@ OPENBMC_UTILS_FILES += " \
     seutil \
     peutil \
     scdinfo \
+    psu_show_tech.py \
+    show_tech.py \
     "
 
 DEPENDS_append = " update-rc.d-native"
@@ -81,13 +86,16 @@ do_install_board() {
     # derivied from the correct MAC address.
     install -m 755 eth0_mac_fixup.sh ${D}${sysconfdir}/init.d/eth0_mac_fixup.sh
     update-rc.d -r ${D} eth0_mac_fixup.sh start 2 2 3 4 5 .
-
+    
     install -m 755 setup_board.sh ${D}${sysconfdir}/init.d/setup_board.sh
     update-rc.d -r ${D} setup_board.sh start 80 S .
 
     install -m 755 power-on.sh ${D}${sysconfdir}/init.d/power-on.sh
     update-rc.d -r ${D} power-on.sh start 85 S .
 
+    install -m 755 sup_eeprom.sh ${D}${sysconfdir}/init.d/sup_eeprom.sh
+    update-rc.d -r ${D} sup_eeprom.sh start 90 2 3 4 5 .
+    
     install -m 0755 ${WORKDIR}/rc.local ${D}${sysconfdir}/init.d/rc.local
     update-rc.d -r ${D} rc.local start 99 2 3 4 5 .
 

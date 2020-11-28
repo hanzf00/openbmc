@@ -21,12 +21,12 @@
 PAL_STATUS_UNSUPPORTED = 2
 
 import os
-from ctypes import *
-from subprocess import *
+from ctypes import CDLL, c_char_p, c_ubyte, create_string_buffer, pointer
+from subprocess import PIPE, CalledProcessError, Popen, check_output
 
 
 try:
-    lpal_hndl = CDLL("libpal.so")
+    lpal_hndl = CDLL("libpal.so.0")
 except OSError:
     lpal_hndl = None
 
@@ -35,9 +35,9 @@ def pal_get_platform_name():
     if lpal_hndl is None:
         machine = "OpenBMC"
         with open("/etc/issue") as f:
-            l = f.read().strip()
-            if l.startswith("OpenBMC Release "):
-                tmp = l.split(" ")
+            line = f.read().strip()
+            if line.startswith("OpenBMC Release "):
+                tmp = line.split(" ")
                 vers = tmp[2]
                 tmp2 = vers.split("-")
                 machine = tmp2[0]
@@ -203,3 +203,9 @@ def pal_set_key_value(key, value):
         ret = lpal_hndl.pal_set_key_value(pkey, pvalue)
         if ret != 0:
             raise ValueError("failure")
+
+
+def pal_get_eth_intf_name():
+    name = create_string_buffer(8)
+    lpal_hndl.pal_get_eth_intf_name(name)
+    return name.value.decode()

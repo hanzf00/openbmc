@@ -34,7 +34,7 @@
 #include <unistd.h>
 #include <openbmc/ipc.h>
 #include "ipmb.h"
-
+#include <openbmc/ipmi.h>
 
 static pthread_key_t rxkey, txkey;
 static pthread_once_t key_once = PTHREAD_ONCE_INIT;
@@ -92,7 +92,7 @@ ipmb_txb()
  */
 int
 lib_ipmb_handle(unsigned char bus_id,
-            unsigned char *request, unsigned short req_len,
+            unsigned char *request, unsigned int req_len,
             unsigned char *response, unsigned char *res_len) {
 
   size_t resp_len = MAX_IPMB_RES_LEN;
@@ -173,4 +173,65 @@ ipmb_send_internal (unsigned char bus_id,
   }
 
   return data_len;
+}
+
+int
+lib_ipmb_send_request(uint8_t ipmi_cmd, uint8_t netfn,
+              uint8_t *txbuf, uint8_t txlen,
+              uint8_t *rxbuf, uint8_t *rxlen,
+              uint8_t bus_num, uint8_t dev_addr, uint8_t bmc_addr) {
+  uint8_t rdata[MAX_IPMB_RES_LEN] = {0x00};
+  uint8_t wdata[MAX_IPMB_RES_LEN] = {0x00};
+  uint8_t tlen = 0;
+  uint8_t rlen = 0;
+  ipmb_req_t *req;
+  ipmb_res_t *res;
+
+  req = (ipmb_req_t*) wdata;
+
+  req->res_slave_addr = dev_addr;
+  req->netfn_lun = netfn << LUN_OFFSET;
+  req->cmd = ipmi_cmd;
+  req->seq_lun = 0x00;
+  req->hdr_cksum = req->res_slave_addr + req->netfn_lun;
+  req->hdr_cksum = ZERO_CKSUM_CONST - req->hdr_cksum;
+
+  req->req_slave_addr = bmc_addr << 1;
+
+  if (txlen) {
+    memcpy(req->data, txbuf, txlen);
+  }
+  tlen = MIN_IPMB_REQ_LEN + txlen;
+
+  // Invoke IPMB library handler
+  lib_ipmb_handle(bus_num, wdata, tlen, rdata, &rlen);
+  res = (ipmb_res_t*) rdata;
+
+  if (rlen == 0) {
+#ifdef DEBUG
+      syslog(LOG_DEBUG, "%s: Zero bytes received cc=0x%x\n", __func__, res->cc);
+#endif
+    return CC_CAN_NOT_RESPOND;
+  }
+
+  // Handle IPMB response
+  if (res->cc) {
+#ifdef DEBUG   
+    syslog(LOG_ERR, "%s: Completion Code: 0x%X\n", __func__, res->cc);
+#endif    
+    return res->cc;
+  }
+
+  // copy the received data back to caller
+  *rxlen = rlen - IPMB_HDR_SIZE - IPMI_RESP_HDR_SIZE;
+  memcpy(rxbuf, res->data, *rxlen);
+
+#ifdef DEBUG
+  {
+    for(int i=0; i< *rxlen; i++)
+    syslog(LOG_WARNING, "rbuf[%d]=%x\n", i, rxbuf[i]);
+  }
+#endif
+
+  return CC_SUCCESS;
 }

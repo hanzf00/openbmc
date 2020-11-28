@@ -22,6 +22,7 @@
 #define __PAL_H__
 
 #include <openbmc/obmc-pal.h>
+#include <openbmc/kv.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,18 +32,19 @@ extern "C" {
 #include <facebook/fby2_common.h>
 #include <facebook/fby2_fruid.h>
 #include <facebook/fby2_sensor.h>
-#include <openbmc/kv.h>
 
-#define MAX_KEY_LEN     64
 #define MAX_NUM_FAN     2
 
 #define MAX_NODES 4
-#define MAX_NUM_DEVS 12
 
 #define MAX_NIC_TEMP_RETRY 3
 
 #define SOCK_PATH_ASD_BIC "/tmp/asd_bic_socket"
 #define SOCK_PATH_JTAG_MSG "/tmp/jtag_msg_socket"
+
+#define YV250_NVMe_Temp_Dev_UCR 75
+
+#define MAX_DEV_JTAG_GPIO 4
 
 extern char * key_list[];
 extern size_t pal_pwm_cnt;
@@ -65,15 +67,6 @@ enum {
 };
 
 enum {
-  DEV_TYPE_UNKNOWN,
-  DEV_TYPE_SSD,
-  DEV_TYPE_VSI_ACC,
-  DEV_TYPE_BRCM_ACC,
-  DEV_TYPE_OTHER_ACC,
-  DEV_TYPE_DUAL_M2,
-};
-
-enum {
   FFI_STORAGE,
   FFI_ACCELERATOR,
 };
@@ -83,10 +76,6 @@ enum {
   MEFF_DUAL_M2 = 0xF0,
 };
 
-enum {
-  VENDOR_VSI = 0x5043,
-  VENDOR_BRCM = 0x875E,
-};
 
 enum {
   DEV_FRU_NOT_COMPLETE,
@@ -152,6 +141,11 @@ enum {
   MICRO_ARCH_ERROR
 };
 
+enum {
+  DRIVE_NOT_READY = 0,
+  DRIVE_READY
+};
+
 int pal_get_platform_name(char *name);
 int pal_get_num_slots(uint8_t *num);
 int pal_get_num_devs(uint8_t slot, uint8_t *num);
@@ -162,11 +156,11 @@ int pal_is_slot_server(uint8_t fru);
 int pal_is_slot_support_update(uint8_t fru);
 int pal_get_server_power(uint8_t slot_id, uint8_t *status);
 int pal_get_device_power(uint8_t slot_id, uint8_t dev_id, uint8_t *status, uint8_t *type);
-int pal_get_dev_info(uint8_t slot_id, uint8_t dev_id, uint8_t *nvme_ready, uint8_t *status, uint8_t *type);
-void pal_power_policy_control(uint8_t slot_id, char *last_ps);
+int pal_get_dev_info(uint8_t slot_id, uint8_t dev_id, uint8_t *nvme_ready, uint8_t *status, uint8_t *type, uint8_t force);
+void pal_power_policy_control(uint8_t slot_id, char *last_ps, bool force);
 int pal_set_server_power(uint8_t slot_id, uint8_t cmd);
 int pal_set_device_power(uint8_t slot_id, uint8_t dev_id, uint8_t cmd);
-int pal_baseboard_clock_control(uint8_t slot_id, char *ctrl);
+int pal_baseboard_clock_control(uint8_t slot_id, int ctrl);
 int pal_is_server_12v_on(uint8_t slot_id, uint8_t *status);
 int pal_slot_pair_12V_off(uint8_t slot_id);
 bool pal_is_hsvc_ongoing(uint8_t slot_id);
@@ -231,6 +225,7 @@ int pal_dev_fruid_write(uint8_t slot, uint8_t dev_id, char *path);
 int pal_is_bmc_por(void);
 int pal_sensor_discrete_check(uint8_t fru, uint8_t snr_num, char *snr_name, uint8_t o_val, uint8_t n_val);
 int pal_get_event_sensor_name(uint8_t fru, uint8_t *sel, char *name);
+void pal_notify_nic(uint8_t slot);
 int pal_parse_sel(uint8_t fru, uint8_t *sel, char *error_log);
 int pal_parse_oem_sel(uint8_t fru, uint8_t *sel, char *error_log);
 int pal_get_event_sensor_name(uint8_t fru, uint8_t *sel, char *name);
@@ -257,7 +252,6 @@ uint8_t pal_get_status(void);
 int pal_bypass_cmd(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len);
 int pal_get_fan_latch(uint8_t *status);
 int pal_ipmb_processing(int bus, void *buf, uint16_t size);
-bool pal_is_mcu_working(void);
 int pal_set_fru_post(uint8_t fru, uint8_t value);
 int pal_get_fru_post(uint8_t fru, uint8_t *value);
 uint8_t pal_is_post_ongoing();
@@ -291,6 +285,21 @@ bool pal_get_pair_fru(uint8_t slot_id, uint8_t *pair_fru);
 bool pal_is_fw_update_ongoing(uint8_t fru);
 int pal_set_sdr_update_flag(uint8_t slot, uint8_t update);
 int pal_get_sdr_update_flag(uint8_t slot);
+int pal_parse_mem_mapping_string(uint8_t channel, bool *support_mem_mapping, char *error_log);
+bool pal_is_modify_sel_time(uint8_t *sel, int size);
+int pal_set_dev_config_setup(uint8_t value);
+int pal_get_dev_config_setup(uint8_t *value);
+int pal_set_dev_sdr_setup(uint8_t fru, uint8_t value);
+int pal_get_dev_sdr_setup(uint8_t fru, uint8_t *value);
+int pal_update_sensor_reading_sdr(uint8_t fru);
+int pal_get_fan_config();
+int pal_display_4byte_post_code(uint8_t slot, uint32_t postcode_dw);
+int pal_set_update_sdr_flag(uint8_t fru, uint8_t value);
+int pal_get_update_sdr_flag(uint8_t fru, uint8_t *value);
+int8_t pal_init_dev_jtag_gpio(uint8_t fru, uint8_t dev);
+int8_t pal_is_dev_com_sel_en (uint8_t fru);
+int8_t pal_dev_jtag_gpio_to_bus(uint8_t fru);
+bool pal_is_all_fan_fail();
 #ifdef __cplusplus
 } // extern "C"
 #endif

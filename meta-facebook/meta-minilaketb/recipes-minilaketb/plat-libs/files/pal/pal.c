@@ -34,10 +34,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include "pal.h"
+#include "pal_sensors.h"
 #include <facebook/bic.h>
 #include <openbmc/kv.h>
 #include <openbmc/obmc-i2c.h>
-#include <openbmc/obmc-sensor.h>
 
 #define BIT(value, index) ((value >> index) & 1)
 
@@ -2489,10 +2489,11 @@ pal_get_sysfw_ver(uint8_t slot, uint8_t *ver) {
 }
 
 int
-pal_get_80port_record(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *res_data, uint8_t *res_len) {
+pal_get_80port_record(uint8_t slot, uint8_t *res_data, size_t max_len, size_t *res_len) {
 
   int ret;
   uint8_t status;
+  uint8_t len;
 
   if (slot != FRU_SLOT1) {
     return PAL_ENOTSUP;
@@ -2516,7 +2517,9 @@ pal_get_80port_record(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t 
   }
 
   // Send command to get 80 port record from Bridge IC
-  ret = bic_request_post_buffer_data(slot, res_data, res_len);
+  ret = bic_request_post_buffer_data(slot, res_data, &len);
+  if (ret == 0)
+    *res_len = len;
 
   return ret;
 }
@@ -4017,20 +4020,21 @@ pal_ipmb_processing(int bus, void *buf, uint16_t size) {
   return 0;
 }
 
-bool
-pal_is_mcu_working(void) {
-  char key[MAX_KEY_LEN] = {0};
+int
+pal_is_mcu_ready(uint8_t bus) {
+  char key[MAX_KEY_LEN];
   char value[MAX_VALUE_LEN] = {0};
   struct timespec ts;
 
   sprintf(key, "ocpdbg_lcd");
   if (kv_get(key, value, NULL, 0)) {
-     return false;
+    return false;
   }
 
   clock_gettime(CLOCK_MONOTONIC, &ts);
-  if (strtoul(value, NULL, 10) > ts.tv_sec)
+  if (strtoul(value, NULL, 10) > ts.tv_sec) {
      return true;
+  }
 
   return false;
 }

@@ -20,11 +20,13 @@
 
 import os.path
 import re
-from subprocess import *
+import json
+from subprocess import PIPE, Popen, check_output, CalledProcessError
 from uuid import getnode as get_mac
 
+import kv
+import pal
 from node import node
-from pal import *
 from vboot import get_vboot_status
 
 
@@ -33,13 +35,13 @@ def read_file_contents(path):
     try:
         with open(path, "r") as proc_file:
             content = proc_file.readlines()
-    except IOError as e:
+    except IOError:
         content = None
 
     return content
 
 
-def getSPIVendor(manufacturer_id):
+def SPIVendorID2Name(manufacturer_id):
     # Define Manufacturer ID
     MFID_WINBOND = "EF"  # Winbond
     MFID_MICRON = "20"  # Micron
@@ -57,25 +59,167 @@ def getSPIVendor(manufacturer_id):
         return "Unknown"
 
 
+def getSPIVendorLegacy(spi_id):
+    cmd = "cat /tmp/spi0.%d_vendor.dat | cut -c1-2" % (spi_id)
+    data = Popen(cmd, shell=True, stdout=PIPE).stdout.read().decode()
+    manufacturer_id = data.strip("\n")
+    return SPIVendorID2Name(manufacturer_id)
+
+
+def getMTD(name):
+    mtd_name = '"' + name + '"'
+    with open("/proc/mtd") as f:
+        lines = f.readlines()
+        for line in lines:
+            if mtd_name in line:
+                return line.split(":")[0]
+    return None
+
+
+def getSPIVendorNew(spi_id):
+    mtd = getMTD("flash%d" % (spi_id))
+    if mtd is None:
+        return "Unknown"
+    debugfs_path = "/sys/kernel/debug/mtd/" + mtd + "/partid"
+    try:
+        with open(debugfs_path) as f:
+            data = f.read().strip()
+            # Example spi-nor:ef4019
+            mfg_id = data.split(":")[-1][0:2].upper()
+            return SPIVendorID2Name(mfg_id)
+    except Exception:
+        pass
+    return "Unknown"
+
+
+def getSPIVendor(spi_id):
+    if os.path.isfile("/tmp/spi0.%d_vendor.dat" % (spi_id)):
+        return getSPIVendorLegacy(spi_id)
+    return getSPIVendorNew(spi_id)
+
+
 class bmcNode(node):
     def __init__(self, info=None, actions=None):
-        if info == None:
+        if info is None:
             self.info = {}
         else:
             self.info = info
-        if actions == None:
+        if actions is None:
             self.actions = []
         else:
             self.actions = actions
 
-    def getInformation(self, param={}):
+    def _getUbootVer(self):
+        # Get U-boot Version
+        uboot_version = None
+        uboot_ver_regex = r"^U-Boot\W+(?P<uboot_ver>20\d{2}\.\d{2})\W+.*$"
+        uboot_ver_re = re.compile(uboot_ver_regex)
+        mtd_meta = getMTD("meta")
+        if mtd_meta == None:
+            mtd0_str_dump_cmd = ["/usr/bin/strings", "/dev/mtd0"]
+            with Popen(mtd0_str_dump_cmd, stdout=PIPE, universal_newlines=True) as proc:
+                for line in proc.stdout:
+                    matched = uboot_ver_re.fullmatch(line.strip())
+                    if matched:
+                        uboot_version = matched.group("uboot_ver")
+                        break
+        else:
+            mtd_dev = "/dev/" + mtd_meta
+            with open(mtd_dev, "r") as f:
+                raw_data = f.readline()
+                try:
+                    uboot_version = json.loads(raw_data)["version_infos"]["uboot_ver"]
+                except:
+                    uboot_version = None
+        return uboot_version
+
+    def getUbootVer(self):
+        UBOOT_VER_KV_KEY = "u-boot-ver"
+        uboot_version = None
+        try:
+            uboot_version = kv.kv_get(UBOOT_VER_KV_KEY)
+        except kv.KeyOperationFailure:
+            # not cahced, read and cache it
+            uboot_version = self._getUbootVer()
+            if uboot_version:
+                kv.kv_set(UBOOT_VER_KV_KEY, uboot_version, kv.FCREATE)
+        return uboot_version
+
+    def getTpmTcgVer(self):
+        out_str = "NA"
+        tpm1_caps = "/sys/class/tpm/tpm0/device/caps"
+        if os.path.isfile(tpm1_caps):
+            with open(tpm1_caps) as f:
+                for line in f:
+                    if "TCG version:" in line:
+                        out_str = line.strip("TCG version: ").strip("\n")
+        elif os.path.isfile("/usr/bin/tpm2_getcap"):
+            cmd_list = []
+            cmd_list.append("/usr/bin/tpm2_getcap -c properties-fixed 2>/dev/null | grep -A2 TPM_PT_FAMILY_INDICATOR")
+            cmd_list.append("/usr/bin/tpm2_getcap properties-fixed 2>/dev/null | grep -A2 TPM2_PT_FAMILY_INDICATOR")
+            for cmd in cmd_list:
+                try:
+                    lines = check_output(cmd, shell=True).decode().split("\n")
+                    out_str = lines[2].rstrip().split("\"")[1]
+                    break
+                except Exception as e:
+                    pass
+        return out_str
+
+    def getTpmFwVer(self):
+        out_str = "NA"
+        tpm1_caps = "/sys/class/tpm/tpm0/device/caps"
+        if os.path.isfile(tpm1_caps):
+            with open(tpm1_caps) as f:
+                for line in f:
+                    if "Firmware version:" in line:
+                        out_str = line.strip("Firmware version: ").strip("\n")
+        elif os.path.isfile("/usr/bin/tpm2_getcap"):
+            cmd_list = []
+            cmd_list.append("/usr/bin/tpm2_getcap -c properties-fixed 2>/dev/null | grep TPM_PT_FIRMWARE_VERSION_1")
+            cmd_list.append("/usr/bin/tpm2_getcap properties-fixed 2>/dev/null | grep -A1 TPM2_PT_FIRMWARE_VERSION_1 | grep raw")
+            for cmd in cmd_list:
+                try:
+                    line = check_output(cmd, shell=True)
+                    value = int(line.decode().rstrip().split(":")[1], 16)
+                    out_str = "%d.%d" % (value >> 16, value & 0xFFFF)
+                    break
+                except Exception as e:
+                    pass
+        return out_str
+
+    def getMemInfo(self):
+        desired_keys = (
+            "MemTotal",
+            "MemAvailable",
+            "MemFree",
+            "Shmem",
+            "Buffers",
+            "Cached",
+        )
+        meminfo = {}
+        with open("/proc/meminfo", "r") as mi:
+            for line in mi:
+                try:
+                    key, value = line.split(":", 1)
+                    key = key.strip()
+                    if key not in desired_keys:
+                        continue
+                    memval, _ = value.strip().split(" ", 1)
+                    meminfo[key] = int(memval)
+                except ValueError:
+                    pass
+        return meminfo
+
+    def getInformation(self, param=None):
         # Get Platform Name
-        name = pal_get_platform_name()
+        name = pal.pal_get_platform_name()
 
         # Get MAC Address
-        mac_path = "/sys/class/net/eth0/address"
+        eth_intf = pal.pal_get_eth_intf_name()
+        mac_path = "/sys/class/net/%s/address" % (eth_intf)
         if os.path.isfile(mac_path):
-            mac = open("/sys/class/net/eth0/address").read()
+            mac = open(mac_path).read()
             mac_addr = mac[0:17].upper()
         else:
             mac = get_mac()
@@ -118,6 +262,8 @@ class bmcNode(node):
         mem_usage = adata[0]
         cpu_usage = adata[1]
 
+        memory = self.getMemInfo()
+
         # Get OpenBMC version
         obc_version = ""
         data = Popen("cat /etc/issue", shell=True, stdout=PIPE).stdout.read().decode()
@@ -127,22 +273,10 @@ class bmcNode(node):
         if ver:
             obc_version = ver.group(1)
 
-        # Get U-boot Version
-        uboot_version = ""
-        data = (
-            Popen("strings /dev/mtd0 | grep U-Boot | grep 20", shell=True, stdout=PIPE)
-            .stdout.read()
-            .decode()
-        )
-
-        # U-boot Version
-        lines = data.splitlines()
-        data_len = len(lines)
-        for i in range(data_len):
-            if i != data_len - 1:
-                uboot_version += lines[i] + ", "
-            else:
-                uboot_version += lines[i]
+        # U-Boot version
+        uboot_version = self.getUbootVer()
+        if uboot_version is None:
+            uboot_version = "NA"
 
         # Get kernel release and kernel version
         kernel_release = ""
@@ -154,36 +288,14 @@ class bmcNode(node):
         kernel_version = data.strip("\n")
 
         # Get TPM version
-        tpm_path = "/sys/class/tpm/tpm0/device/caps"
         tpm_tcg_version = "NA"
         tpm_fw_version = "NA"
-        if os.path.isfile(tpm_path):
-            with open(tpm_path) as f:
-                for line in f:
-                    if "TCG version:" in line:
-                        tpm_tcg_version = line.strip("TCG version: ").strip("\n")
-                    elif "Firmware version:" in line:
-                        tpm_fw_version = line.strip("Firmware version: ").strip("\n")
+        if os.path.exists("/sys/class/tpm/tpm0"):
+            tpm_tcg_version = self.getTpmTcgVer()
+            tpm_fw_version = self.getTpmFwVer()
 
-        # SPI0 Vendor
-        spi0_vendor = ""
-        data = (
-            Popen("cat /tmp/spi0.0_vendor.dat | cut -c1-2", shell=True, stdout=PIPE)
-            .stdout.read()
-            .decode()
-        )
-        spi0_mfid = data.strip("\n")
-        spi0_vendor = getSPIVendor(spi0_mfid)
-
-        # SPI1 Vendor
-        spi1_vendor = ""
-        data = (
-            Popen("cat /tmp/spi0.1_vendor.dat | cut -c1-2", shell=True, stdout=PIPE)
-            .stdout.read()
-            .decode()
-        )
-        spi1_mfid = data.strip("\n")
-        spi1_vendor = getSPIVendor(spi1_mfid)
+        spi0_vendor = getSPIVendor(0)
+        spi1_vendor = getSPIVendor(1)
 
         # ASD status - check if ASD daemon/asd-test is currently running
         asd_status = bool(
@@ -204,6 +316,7 @@ class bmcNode(node):
             # more pass-through proxy
             "uptime": uptime_seconds,
             "Memory Usage": mem_usage,
+            "memory": memory,
             "CPU Usage": cpu_usage,
             "OpenBMC Version": obc_version,
             "u-boot version": uboot_version,
@@ -222,7 +335,7 @@ class bmcNode(node):
 
         return info
 
-    def doAction(self, data, param={}):
+    def doAction(self, data, param=None):
         Popen("sleep 1; /sbin/reboot", shell=True, stdout=PIPE)
         return {"result": "success"}
 

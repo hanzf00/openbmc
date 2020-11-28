@@ -62,13 +62,17 @@
 #include <poll.h>
 #include <assert.h>
 #include <getopt.h>
+#include <stddef.h>
 #include <linux/limits.h>
+#include <linux/version.h>
+
 #include <openbmc/log.h>
 #include <openbmc/obmc-i2c.h>
 #include <openbmc/obmc-pal.h>
 #include <openbmc/ipc.h>
 #include <openbmc/ipmi.h>
 #include <openbmc/ipmb.h>
+#include <openbmc/misc-utils.h>
 
 /*
  * IPMB packet sizes.
@@ -361,11 +365,18 @@ ipmb_req_handler(void *args) {
     p_ipmi_mn_req->netfn_lun = p_ipmb_req->netfn_lun;
     p_ipmi_mn_req->cmd = p_ipmb_req->cmd;
 
-    memcpy(p_ipmi_mn_req->data, p_ipmb_req->data,
-           rlen - IPMB_HDR_SIZE - IPMI_REQ_HDR_SIZE);
+    if ( rlen > offsetof(ipmb_req_t, data) ) {
+      // did not copy the checksum
+      memcpy(p_ipmi_mn_req->data, p_ipmb_req->data, rlen - offsetof(ipmb_req_t, data) - 1 );
+    }
+    else {
+      syslog(LOG_ERR, "ignore malformed (len = %d) ipmb request\n", rlen);
+      continue;
+    }
 
     // Send to IPMI stack and get response
     // Additional byte as we are adding and passing payload ID for MN support
+    tlen = 0; // init tlen output incase lib_ipmi_handle did not set this value
     lib_ipmi_handle(rbuf, rlen - IPMB_HDR_SIZE + 1, tbuf, &tlen);
 
     // Populate IPMB response data from IPMB request
@@ -373,12 +384,22 @@ ipmb_req_handler(void *args) {
     p_ipmb_res->res_slave_addr = p_ipmb_req->res_slave_addr;
     p_ipmb_res->cmd = p_ipmb_req->cmd;
     p_ipmb_res->seq_lun = p_ipmb_req->seq_lun;
+    p_ipmb_res->netfn_lun = p_ipmb_req->netfn_lun | (1 << LUN_OFFSET);
 
     // Add IPMI response data
-    p_ipmb_res->netfn_lun = p_ipmi_res->netfn_lun;
-    p_ipmb_res->cc = p_ipmi_res->cc;
-
-    memcpy(p_ipmb_res->data, p_ipmi_res->data, tlen - IPMI_RESP_HDR_SIZE);
+    size_t res_data_len = 0;
+    if (tlen >= offsetof(ipmi_res_t, data)) {
+      // Add IPMI response data
+      p_ipmb_res->cc = p_ipmi_res->cc;
+      res_data_len = tlen - offsetof(ipmi_res_t, data);
+      memcpy(p_ipmb_res->data, p_ipmi_res->data, res_data_len);
+    }
+    else {
+      // malformed response get from ipmid
+      syslog(LOG_ERR, "Req( %02X - %02X ) receive malformed (len = %d) response from ipmid\n",
+        p_ipmb_req->netfn_lun >> 2, p_ipmb_req->cmd, tlen);
+      p_ipmb_res->cc = CC_NOT_SUPP_IN_CURR_STATE;
+    }
 
     // Calculate Header Checksum
     p_ipmb_res->hdr_cksum = p_ipmb_res->req_slave_addr +
@@ -386,29 +407,28 @@ ipmb_req_handler(void *args) {
     p_ipmb_res->hdr_cksum = ZERO_CKSUM_CONST - p_ipmb_res->hdr_cksum;
 
     // Calculate Data Checksum
-    p_ipmb_res->data[tlen-IPMI_RESP_HDR_SIZE] = p_ipmb_res->res_slave_addr +
+    uint8_t data_chk_sum = p_ipmb_res->res_slave_addr +
                             p_ipmb_res->seq_lun +
                             p_ipmb_res->cmd +
                             p_ipmb_res->cc;
 
-    for (i = 0; i < tlen-IPMI_RESP_HDR_SIZE; i++) {
-      p_ipmb_res->data[tlen-IPMI_RESP_HDR_SIZE] += p_ipmb_res->data[i];
+    for (i = 0; i < res_data_len; i++) {
+      data_chk_sum += p_ipmb_res->data[i];
     }
 
-    p_ipmb_res->data[tlen-IPMI_RESP_HDR_SIZE] = ZERO_CKSUM_CONST -
-                                      p_ipmb_res->data[tlen-IPMI_RESP_HDR_SIZE];
+    p_ipmb_res->data[res_data_len] = ZERO_CKSUM_CONST - data_chk_sum;
+    // include data-checksum +1
+    size_t txlen = offsetof(ipmb_res_t, data) + res_data_len + 1;
 
 #ifdef DEBUG
-    syslog(LOG_WARNING, "Sending Response of %d bytes\n", tlen+IPMB_HDR_SIZE-1);
-    for (i = 0; i < tlen+IPMB_HDR_SIZE; i++) {
+    syslog(LOG_WARNING, "Sending Response of %d bytes\n", txlen);
+    for (i = 0; i < txlen; i++) {
       syslog(LOG_WARNING, "0x%X:", txbuf[i]);
     }
 #endif
-
-     // Send response back
-     ipmb_write_satellite(fd, txbuf, tlen+IPMB_HDR_SIZE);
-
-     pal_ipmb_finished(bus_num, txbuf, tlen+IPMB_HDR_SIZE);
+    // Send response back
+    ipmb_write_satellite(fd, txbuf, txlen);
+    pal_ipmb_finished(bus_num, txbuf, txlen);
   }
 }
 
@@ -462,6 +482,34 @@ ipmb_res_handler(void *args) {
   }
 }
 
+/*
+ * Determine poll() timeout value based on kernel versions:
+ * - kernel 4.1:
+ *   poll() cannot return when BMC slave buffer is filled with data (due
+ *   to the implementation BMC slave transfer), thus we need a smaller
+ *   timeout (polling every 10 milliseconds) so ipmbd can obtain ipmi
+ *   messages from its peer timely.
+ * - kernel 5.0 (or higher versions):
+ *   poll() returns when BMC slave buffer is filled with data, so it can
+ *   be a negative value (infinite timeout) technically. Setting it to 3
+ *   seconds is a little conservative, so feel free to adjust the value.
+ */
+static int
+determine_poll_timeout(void)
+{
+  int timeout;
+  k_version_t cur_ver;
+
+  cur_ver = get_kernel_version();
+  if (cur_ver <= KERNEL_VERSION(4, 1, 51)) {
+    timeout = 10;    /* 10 milliseconds */
+  } else {
+    timeout = 3000;  /* 3 seconds */
+  }
+
+  return timeout;
+}
+
 // Thread to receive the IPMB messages over i2c bus as a slave
 static void*
 ipmb_rx_handler(void *args) {
@@ -476,6 +524,7 @@ ipmb_rx_handler(void *args) {
   int bus_num = *((int*)args);
   uint16_t addr=0;
   int ret=0;
+  int poll_timeout = determine_poll_timeout();
 
   RX_VERBOSE("thread starts execution");
 
@@ -526,7 +575,7 @@ ipmb_rx_handler(void *args) {
     // Read messages from i2c driver
     ret = i2c_mslave_read(bmc_slave, buf, sizeof(buf));
     if (ret <= 0) {
-      i2c_mslave_poll(bmc_slave, 10);
+      i2c_mslave_poll(bmc_slave, poll_timeout);
       continue;
     }
     len = (uint8_t)ret;
@@ -703,15 +752,28 @@ struct ipmb_svc_cookie {
 static int
 conn_handler(client_t *cli) {
   struct ipmb_svc_cookie *svc = (struct ipmb_svc_cookie *)cli->svc_cookie;
-  unsigned char req_buf[MAX_IPMB_RES_LEN];
+  unsigned char req_buf[MAX_IPMB_REQ_LEN];
   unsigned char res_buf[MAX_IPMB_RES_LEN];
-  size_t req_len = MAX_IPMB_RES_LEN;
+  size_t req_len = MAX_IPMB_REQ_LEN;
   unsigned char res_len=0;
 
   SVC_VERBOSE("entering svc handler");
   if (ipc_recv_req(cli, req_buf, &req_len, TIMEOUT_IPMB)) {
     OBMC_ERROR(errno, "%s: ipc_recv_req() failed", IPMBD_SVC_THREAD);
     return -1;
+  }
+
+  if (req_len == IPMB_PING_LEN) { // get IANA then sends back
+    res_len = IPMB_PING_LEN;
+    res_buf[0] = req_buf[0];
+    res_buf[1] = req_buf[1];
+    res_buf[2] = req_buf[2];
+    if (ipc_send_resp(cli, res_buf, res_len) != 0) {
+      OBMC_ERROR(errno, "%s: ipc_send_resp() failed", IPMBD_SVC_THREAD);
+      return -1;
+    }
+    syslog(LOG_WARNING, "%s IPMB BUS_ID=%x ping scuess\n", __func__,ipmbd_config.bus_id);
+    return 0;
   }
 
   if(ipmbd_config.bic_update_enabled) {
@@ -722,7 +784,7 @@ conn_handler(client_t *cli) {
   }
 
   ipmb_handle(svc->i2c_fd, req_buf,
-              (unsigned short)req_len, res_buf, &res_len);
+              (unsigned int)req_len, res_buf, &res_len);
 
   if(ipc_send_resp(cli, res_buf, res_len) != 0) {
     OBMC_ERROR(errno, "%s: ipc_send_resp() failed", IPMBD_SVC_THREAD);

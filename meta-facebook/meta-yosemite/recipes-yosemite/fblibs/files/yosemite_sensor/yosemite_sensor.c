@@ -31,7 +31,7 @@
 #include <dirent.h>
 #include <sys/mman.h>
 #include <openbmc/obmc-i2c.h>
-#include <openbmc/obmc-sensor.h>
+#include <openbmc/obmc_pal_sensors.h>
 #include "yosemite_sensor.h"
 
 #define LARGEST_DEVICE_NAME 120
@@ -509,7 +509,7 @@ bic_read_sensor_wrapper(uint8_t fru, uint8_t sensor_num, bool discrete,
     syslog(LOG_ERR, "bic_read_sensor_wrapper: sensor_num: 0x%X, flag: 0x%X",
         sensor_num, sensor.flags);
 #endif
-    return -1;
+    return ERR_SENSOR_NA;
   }
 
   if (discrete) {
@@ -810,7 +810,7 @@ yosemite_sensor_units(uint8_t fru, uint8_t sensor_num, char *units) {
           sprintf(units, "C");
           break;
         case PORT_0_LINK_SPEED:
-          sprintf(units, "100Mbps");
+          sprintf(units, "Gbps");
           break;
         case NIC_HEALTH_STATE:
           strcpy(units, "");

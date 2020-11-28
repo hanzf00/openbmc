@@ -704,7 +704,7 @@ _update_bic_main(uint8_t slot_id, char *path) {
 
     // Kill ipmb daemon "--enable-bic-update" for this slot
     memset(cmd, 0, sizeof(cmd));
-    sprintf(cmd, "ps | grep -v 'grep' | grep 'ipmbd -u %d' |awk '{print $1}'| xargs kill", get_ipmb_bus_id(slot_id));
+    sprintf(cmd, "ps -w | grep -v 'grep' | grep 'ipmbd -u %d' |awk '{print $1}'| xargs kill", get_ipmb_bus_id(slot_id));
     system(cmd);
     printf("stop ipmbd for slot %x..\n", slot_id);
   }
@@ -1167,6 +1167,7 @@ bic_update_firmware(uint8_t slot_id, uint8_t comp, char *path, uint8_t force) {
            printf("updated bic boot loader: %d %%\n", offset/dsize*5);
            break;
        }
+       fflush(stdout);
        last_offset += dsize;
     }
   }
@@ -1599,6 +1600,24 @@ bic_get_sys_guid(uint8_t slot_id, uint8_t *guid) {
 #endif
     return -1;
   }
+
+  return ret;
+}
+
+int
+bic_master_write_read(uint8_t slot_id, uint8_t bus, uint8_t addr, uint8_t *wbuf, uint8_t wcnt, uint8_t *rbuf, uint8_t rcnt) {
+  uint8_t tbuf[256];
+  uint8_t tlen = 3, rlen = 0;
+  int ret;
+
+  tbuf[0] = bus;
+  tbuf[1] = addr;
+  tbuf[2] = rcnt;
+  if (wcnt) {
+    memcpy(&tbuf[3], wbuf, wcnt);
+    tlen += wcnt;
+  }
+  ret = bic_ipmb_wrapper(slot_id, NETFN_APP_REQ, CMD_APP_MASTER_WRITE_READ, tbuf, tlen, rbuf, &rlen);
 
   return ret;
 }

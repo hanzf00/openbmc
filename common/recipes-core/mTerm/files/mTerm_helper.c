@@ -31,7 +31,7 @@
 static char g_fru[16];
 
 void setFru(char *dev) {
-    strncpy(g_fru, dev, sizeof(g_fru));
+    strncpy(g_fru, dev, sizeof(g_fru) - 1);
 }
 
 void escHelp(void) {
@@ -258,7 +258,9 @@ void writeToBuffer(bufStore *buf, char* data, int len) {
    // Rollover to a backup file when buffer hits filesize
    if (rotate) {
      backupBuffer(buf);
-     ftruncate(buf->buf_fd, 0);
+     if (ftruncate(buf->buf_fd, 0) != 0) {
+       syslog(LOG_WARNING, "Truncation post-rotation failed, errno=%d\n", errno);
+     }
      syncfs(buf->buf_fd);
      lseek(buf->buf_fd, 0, SEEK_SET);
    }

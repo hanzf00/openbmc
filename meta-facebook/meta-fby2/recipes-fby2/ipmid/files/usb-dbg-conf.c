@@ -6,8 +6,9 @@
 #include <openbmc/pal.h>
 #include <openbmc/sdr.h>
 #include <openbmc/gpio.h>
-#include <openbmc/obmc-sensor.h>
+#include <openbmc/pal_sensors.h>
 #include <facebook/bic.h>
+#include <facebook/fby2_common.h>
 #include <syslog.h>
 
 #include "usb-dbg-conf.h"
@@ -362,6 +363,14 @@ static post_phase_desc_t post_phase_desc[] = {
   {2, pdesc_phase2, sizeof(pdesc_phase2)/sizeof(pdesc_phase2[0])},
 };
 
+static post_desc_t nd_pdesc_phase[] = {
+  { 0xFF, "THE_LAST_EVENT" },
+};
+
+static post_phase_desc_t nd_post_phase_desc[] = {
+  {PHASE_ANY, nd_pdesc_phase, sizeof(nd_pdesc_phase)/sizeof(nd_pdesc_phase[0])},
+};
+
 //These postcodes are defined in document "Robinson Creek UEFI Specification" Version: 0.5
 static post_desc_t rc_pdesc_phase[] = {
   { 0x00, "Not used" },
@@ -710,6 +719,10 @@ int plat_get_post_phase(uint8_t fru, post_phase_desc_t **desc, size_t *desc_coun
       *desc = rc_post_phase_desc;
       *desc_count = sizeof(rc_post_phase_desc) / sizeof(rc_post_phase_desc[0]);
       break;
+    case SERVER_TYPE_ND:
+      *desc = nd_post_phase_desc;
+      *desc_count = sizeof(nd_post_phase_desc) / sizeof(nd_post_phase_desc[0]);
+      break;
     default:
       *desc = post_phase_desc;
       *desc_count = sizeof(post_phase_desc) / sizeof(post_phase_desc[0]);
@@ -831,9 +844,15 @@ int plat_get_me_status(uint8_t fru, char *status)
 
 int plat_get_board_id(char *id)
 {
-  uint8_t board_id;
-  board_id = gpio_get(GPIO_BOARD_ID);
+  int board_id;
+
+  board_id = fby2_common_get_board_id();
+  if (board_id < 0) {
+    syslog(LOG_WARNING, "plat_get_board_id: fail to get spb board id");
+    return -1;
+  }
   sprintf(id, "%02d", board_id);
+
   return 0;
 }
 
@@ -873,12 +892,47 @@ int plat_get_etra_fw_version(uint8_t slot_id, char *text)
       strcat(text, entry);
     }
 
-    //PCIE switch Version
-    if (bic_get_fw_ver(slot_id, FW_PCIE_SWITCH, ver)){
-      strcat(text,"PCIE_SW_ver:\nNA\n");
+    //PCIE switch Config Version
+    if (bic_get_fw_ver(slot_id, FW_PCIE_SWITCH_CFG, ver)){
+      strcat(text,"PCIE_SW_CFG_ver:\nNA\n");
     } else {
-      sprintf(entry,"PCIE_SW_ver:\n0x%02x%02x%02x%02x\n", ver[0], ver[1], ver[2], ver[3]);
+      sprintf(entry,"PCIE_SW_CFG_ver:\n0x%02x%02x%02x%02x\n", ver[0], ver[1], ver[2], ver[3]);
       strcat(text, entry);
+    }
+
+    //PCIE switch Firmware Version
+    if (bic_get_fw_ver(slot_id, FW_PCIE_SWITCH_FW, ver)){
+      strcat(text,"PCIE_SW_FW_ver:\nNA\n");
+    } else {
+      sprintf(entry,"PCIE_SW_FW_ver:\n0x%02x%02x%02x%02x\n", ver[0], ver[1], ver[2], ver[3]);
+      strcat(text, entry);
+    }
+
+    //PCIE switch Bootloader Version
+    if (bic_get_fw_ver(slot_id, FW_PCIE_SWITCH_BL, ver)){
+      strncat(text,"PCIE_SW_BL_ver:\nNA\n", MAX_VALUE_LEN);
+    } else {
+      snprintf(entry, sizeof(entry), "PCIE_SW_BL_ver: 0x%02x%02x (%s, %s)\n", 
+              ver[2], ver[3], (ver[0]? "Active": "Inactive"), (ver[1]? "Valid": "Invalid"));
+      strncat(text, entry, MAX_VALUE_LEN);
+    }
+
+    //PCIE switch Partition0 Version
+    if (bic_get_fw_ver(slot_id, FW_PCIE_SWITCH_PARTMAP0, ver)){
+      strncat(text,"FW_PCIE_SWITCH_PARTMAP0:\nNA\n", MAX_VALUE_LEN);
+    } else {
+      snprintf(entry, sizeof(entry), "FW_PCIE_SWITCH_PARTMAP0: 0x%02x%02x (%s, %s)\n", 
+              ver[2], ver[3], (ver[0]? "Active": "Inactive"), (ver[1]? "Valid": "Invalid"));
+      strncat(text, entry, MAX_VALUE_LEN);
+    }
+
+    //PCIE switch Partition1 Version
+    if (bic_get_fw_ver(slot_id, FW_PCIE_SWITCH_PARTMAP1, ver)){
+      strncat(text,"FW_PCIE_SWITCH_PARTMAP1:\nNA\n", MAX_VALUE_LEN);
+    } else {
+      snprintf(entry, sizeof(entry), "FW_PCIE_SWITCH_PARTMAP1: 0x%02x%02x (%s, %s)\n", 
+              ver[2], ver[3], (ver[0]? "Active": "Inactive"), (ver[1]? "Valid": "Invalid"));
+      strncat(text, entry, MAX_VALUE_LEN);
     }
   }
 

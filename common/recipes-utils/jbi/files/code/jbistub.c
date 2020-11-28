@@ -83,6 +83,7 @@ typedef unsigned long DWORD;
 #include <openbmc/hr_nanosleep.h>
 #include <openbmc/log.h>
 #include <errno.h>
+#include <sys/ioctl.h>
 #endif
 
 #if PORT == DOS
@@ -149,14 +150,18 @@ void initialize_jtag_hardware(void);
 void close_jtag_hardware(void);
 
 #ifdef OPENBMC
-int g_tck = -1;
-int g_tms = -1;
-int g_tdo = -1;
-int g_tdi = -1;
-gpio_st g_gpio_tck;
-gpio_st g_gpio_tms;
-gpio_st g_gpio_tdo;
-gpio_st g_gpio_tdi;
+static int g_swio = 0;
+static int g_tck = -1;
+static int g_tms = -1;
+static int g_tdo = -1;
+static int g_tdi = -1;
+static int g_jtag_dev = -1;
+static gpio_st g_gpio_tck = {.gs_fd = -1};
+static gpio_st g_gpio_tms = {.gs_fd = -1};
+static gpio_st g_gpio_tdo = {.gs_fd = -1};
+static gpio_st g_gpio_tdi = {.gs_fd = -1};
+
+static int (*jtag_io_func)(int, int, int);
 #endif
 
 #if defined(USE_STATIC_MEMORY)
@@ -246,7 +251,125 @@ BOOL verbose = FALSE;
 
 #ifdef OPENBMC
 
-int initialize_jtag_gpios()
+#define JTAG_CHAR_DEV "/dev/jtag0"
+
+#ifndef JTAG_SYSFS_DIR
+#define JTAG_SYSFS_DIR "/sys/devices/platform/ahb/ahb:apb/1e6e4000.jtag/"
+#endif
+#define JTAG_SYSFS_TDI JTAG_SYSFS_DIR "tdi"
+#define JTAG_SYSFS_TDO JTAG_SYSFS_DIR "tdo"
+#define JTAG_SYSFS_TMS JTAG_SYSFS_DIR "tms"
+#define JTAG_SYSFS_TCK JTAG_SYSFS_DIR "tck"
+
+#define __JTAG_IOCTL_MAGIC 0xb2
+#define JTAG_IOCBITBANG _IOW(__JTAG_IOCTL_MAGIC, 6, unsigned int)
+
+struct tck_bitbang {
+  unsigned char tms;
+  unsigned char tdi;
+  unsigned char tdo;
+} __attribute__((__packed__));
+
+static void jtag_swio_write(int fd, int value) {
+  if (lseek(fd, 0, SEEK_SET) < 0) {
+    fprintf(stderr, "%s: lseek failed\n", __func__);
+    return;
+  }
+  if (write(fd, (value) ? "1" : "0", 1) != 1) {
+    fprintf(stderr, "%s: write failed\n", __func__);
+  }
+  return;
+}
+
+static int jtag_swio_read(int fd) {
+  char buf[8] = {0};
+
+  if (lseek(fd, 0, SEEK_SET) < 0) {
+    fprintf(stderr, "%s: lseek failed\n", __func__);
+    return -1;
+  }
+  if (read(fd, buf, sizeof(buf) - 1) < 1) {
+    fprintf(stderr, "%s: read failed\n", __func__);
+    return -1;
+  }
+
+  return (atoi(buf) ? GPIO_VALUE_HIGH : GPIO_VALUE_LOW);
+}
+
+static int initialize_jtag_swio(void) {
+  if ((g_jtag_dev = open(JTAG_CHAR_DEV, O_RDWR)) < 0) {
+    OBMC_ERROR(errno, "failed to open jtag device %s", JTAG_CHAR_DEV);
+  } else {
+    /* Use ioctl(JTAG_IOCBITBANG) if successfully open Kernel 5.6 JTAG driver */
+    return 0;
+  }
+
+  if (((g_gpio_tdi.gs_fd = open(JTAG_SYSFS_TDI, O_WRONLY)) < 0) ||
+      ((g_gpio_tck.gs_fd = open(JTAG_SYSFS_TCK, O_WRONLY)) < 0) ||
+      ((g_gpio_tms.gs_fd = open(JTAG_SYSFS_TMS, O_WRONLY)) < 0) ||
+      ((g_gpio_tdo.gs_fd = open(JTAG_SYSFS_TDO, O_RDONLY)) < 0)) {
+    fprintf(stderr, "%s: open failed\n", __func__);
+    return -1;
+  }
+
+  /* set tck, tms, tdi to low */
+  jtag_swio_write(g_gpio_tck.gs_fd, GPIO_VALUE_LOW);
+  jtag_swio_write(g_gpio_tms.gs_fd, GPIO_VALUE_LOW);
+  jtag_swio_write(g_gpio_tdi.gs_fd, GPIO_VALUE_LOW);
+  jbi_delay(1);
+
+  return 0;
+}
+
+static int jbi_jtag_swio(int tms, int tdi, int read_tdo) {
+  int tdo = 0;
+  struct tck_bitbang bitbang;
+
+  if (!jtag_hardware_initialized) {
+    if (initialize_jtag_swio()) {
+      fprintf(stderr, "%s: initialize_jtag_swio() failed\n", __func__);
+      return -1;
+    }
+    jtag_hardware_initialized = TRUE;
+  }
+
+  if (g_jtag_dev >= 0) {
+    bitbang.tms = tms ? GPIO_VALUE_HIGH : GPIO_VALUE_LOW;
+    bitbang.tdi = tdi ? GPIO_VALUE_HIGH : GPIO_VALUE_LOW;
+    bitbang.tdo = 0;
+    if (ioctl(g_jtag_dev, JTAG_IOCBITBANG, &bitbang) < 0) {
+      fprintf(stderr, "%s: ioctl(JTAG_IOCBITBANG) failed\n", __func__);
+      return -1;
+    }
+
+    if (read_tdo) {
+      tdo = bitbang.tdo;
+    }
+  } else {
+    jtag_swio_write(g_gpio_tms.gs_fd, tms ? GPIO_VALUE_HIGH : GPIO_VALUE_LOW);
+    jtag_swio_write(g_gpio_tdi.gs_fd, tdi ? GPIO_VALUE_HIGH : GPIO_VALUE_LOW);
+
+    /*
+     * if we need to read data, the data should be ready from the
+     * previous clock falling edge. Read it now.
+     */
+    if (read_tdo && ((tdo = jtag_swio_read(g_gpio_tdo.gs_fd)) < 0)) {
+      fprintf(stderr, "%s: jtag_swio_read() failed\n", __func__);
+      return -1;
+    }
+
+    /* do rising edge to clock out the data */
+    jtag_swio_write(g_gpio_tck.gs_fd, GPIO_VALUE_HIGH);
+
+    /* do falling edge clocking */
+    jtag_swio_write(g_gpio_tck.gs_fd, GPIO_VALUE_LOW);
+  }
+
+  OBMC_DEBUG("tms=%d tdi=%d do_read=%d tdo=%d", tms, tdi, read_tdo, tdo);
+  return tdo;
+}
+
+static int initialize_jtag_gpios()
 {
   if (gpio_open(&g_gpio_tck, g_tck) || gpio_open(&g_gpio_tms, g_tms)
       || gpio_open(&g_gpio_tdo, g_tdo) || gpio_open(&g_gpio_tdi, g_tdi)) {
@@ -275,14 +398,17 @@ int initialize_jtag_gpios()
   return 0;
 }
 
-int jbi_jtag_io(int tms, int tdi, int read_tdo)
+static int jbi_jtag_gpio(int tms, int tdi, int read_tdo)
 {
   int tdo = 0;
 
-	if (!jtag_hardware_initialized)	{
-		initialize_jtag_gpios();
-		jtag_hardware_initialized = TRUE;
-	}
+  if (!jtag_hardware_initialized) {
+    if (initialize_jtag_gpios()) {
+      fprintf(stderr, "%s: initialize_jtag_gpios() failed\n", __func__);
+      return -1;
+    }
+    jtag_hardware_initialized = TRUE;
+  }
 
   gpio_write(&g_gpio_tms, tms ? GPIO_VALUE_HIGH : GPIO_VALUE_LOW);
   gpio_write(&g_gpio_tdi, tdi ? GPIO_VALUE_HIGH : GPIO_VALUE_LOW);
@@ -305,6 +431,11 @@ int jbi_jtag_io(int tms, int tdi, int read_tdo)
              tms, tdi, read_tdo, tdo);
 
   return tdo;
+}
+
+int jbi_jtag_io(int tms, int tdi, int read_tdo)
+{
+  return jtag_io_func(tms, tdi, read_tdo);
 }
 
 #else
@@ -502,7 +633,7 @@ void jbi_delay(long microseconds)
 #endif
 
 #ifdef OPENBMC
-  hr_nanosleep(microseconds * 1000);
+	hr_nanosleep(microseconds * 1000);
 #else
 	delay_loop(microseconds *
 		((one_ms_delay / 1000L) + ((one_ms_delay % 1000L) ? 1 : 0)));
@@ -1051,22 +1182,28 @@ int main(int argc, char **argv)
 				break;
 
 #ifdef OPENBMC
-      case 'G':                 /* GPIO directory */
-        switch (toupper(argv[arg][2])) {
-        case 'C':
-          g_tck = atoi(&argv[arg][3]);
-          break;
-        case 'S':
-          g_tms = atoi(&argv[arg][3]);
-          break;
-        case 'I':
-          g_tdi = atoi(&argv[arg][3]);
-          break;
-        case 'O':
-          g_tdo = atoi(&argv[arg][3]);
-          break;
-        }
-        break;
+			case 'G':				/* GPIO directory */
+				switch (toupper(argv[arg][2])) {
+				case 'C':
+					g_tck = atoi(&argv[arg][3]);
+					break;
+				case 'S':
+					g_tms = atoi(&argv[arg][3]);
+					break;
+				case 'I':
+					g_tdi = atoi(&argv[arg][3]);
+					break;
+				case 'O':
+					g_tdo = atoi(&argv[arg][3]);
+					break;
+				}
+				jtag_io_func = jbi_jtag_gpio;
+				break;
+
+			case 'W':				/* use software mode to control jtag pins */
+				g_swio = 1;
+				jtag_io_func = jbi_jtag_swio;
+				break;
 #else
 			case 'S':				/* set serial port address */
 				serial_port_name = &argv[arg][2];
@@ -1130,7 +1267,7 @@ int main(int argc, char **argv)
 
 #ifdef OPENBMC
   if (execute_program) {
-    if (g_tck == -1 || g_tms == -1 || g_tdo == -1 || g_tdi == -1) {
+    if (!g_swio && (g_tck == -1 || g_tms == -1 || g_tdo == -1 || g_tdi == -1)) {
       fprintf(stderr, "Error:  -gc, -gs, -gi, and -go must be specified\n");
       help = TRUE;
     }
@@ -1916,6 +2053,19 @@ void close_jtag_hardware()
 			CloseHandle(nt_device_handle);
 		}
 #endif
+#endif
+
+#ifdef OPENBMC
+		if (g_gpio_tck.gs_fd >= 0)
+			close(g_gpio_tck.gs_fd);
+		if (g_gpio_tms.gs_fd >= 0)
+			close(g_gpio_tms.gs_fd);
+		if (g_gpio_tdo.gs_fd >= 0)
+			close(g_gpio_tdo.gs_fd);
+		if (g_gpio_tdi.gs_fd >= 0)
+			close(g_gpio_tdi.gs_fd);
+		if (g_jtag_dev >= 0)
+			close(g_jtag_dev);
 #endif
 	}
 }

@@ -18,6 +18,7 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -33,7 +34,7 @@
 #include <jansson.h>
 #include <openbmc/pal.h>
 #include <openbmc/sdr.h>
-#include <openbmc/obmc-sensor.h>
+#include <openbmc/pal_sensors.h>
 #include <openbmc/aggregate-sensor.h>
 
 #define STATUS_OK   "ok"
@@ -44,6 +45,11 @@
 #define STATUS_LNC  "lnc"
 #define STATUS_LCR  "lcr"
 #define STATUS_LNR  "lnr"
+#define STATUS_NC   "nc"
+#define STATUS_CR   "cr"
+#define STATUS_NR   "nr"
+
+#define UNKNOWN_STATE "Unknown"
 
 #define SENSOR_ALL             -1
 #ifdef CUSTOM_FRU_LIST
@@ -65,6 +71,9 @@ typedef struct {
   bool threshold;
   bool force;
   bool json;
+  bool filter;
+  char ** filter_list;
+  int filter_len;
   json_t *fru_sensor_obj;
   uint8_t *sensor_list;
 } get_sensor_reading_struct;
@@ -79,8 +88,22 @@ const char *sensor_state_str[] = {
     "LowerCritical",
     "LowerFatal",
     "UpperWarning",
-    "Critical",
+    "UpperCritical",
     "UpperFatal",
+};
+
+const char *sensor_status[] = {
+    STATUS_NS,
+    STATUS_OK,
+    STATUS_NC,
+    STATUS_CR,
+    STATUS_NR,
+    STATUS_LNC,
+    STATUS_LCR,
+    STATUS_LNR,
+    STATUS_UNC,
+    STATUS_UCR,
+    STATUS_UNR
 };
 
 static void
@@ -99,6 +122,14 @@ print_usage() {
   printf("         --history-clear           clear history values\n");
   printf("         --force                   read the sensor directly from the h/w (not cache).Ensure sensord is killed before executing this command\n");
   printf("         --json                    JSON representation\n");
+  printf("         --filter <sensor name with slot name>  filtered by <sensor name with slot name> for fscd usage.\n");
+  printf("                                   <sensor name with slot_name> will convert space \" \" to \"_\",and convert upper case to lower case before filtering\n");
+  printf("         <sensor name with slot name>: \"<slot_name>_<sensor_name>\" \n");
+  printf("                                       \"<slot_name> <sensor_name>\" \n");
+  printf("         e.g.,  sensor-util all --filter \"slot2_soc_therm_margin\" \n");
+  printf("                slot2 SOC Therm Margin       (0xXX) :  XX.XX C     | (ok) \n");
+  printf("         e.g.,  sensor-util all --filter \"slot2 SOC Therm Margin\" \n");
+  printf("                slot2 SOC Therm Margin       (0xXX) :  XX.XX C     | (ok) \n");
 }
 
 static int convert_period(char *str, long *val) {
@@ -163,60 +194,133 @@ is_pldm_state_sensor(uint8_t snr_num, uint8_t fru)
   return 0;
 }
 
+static int
+is_supported_sensor(uint8_t snr_num, uint8_t fru)
+{
+  if (pal_is_sensor_valid(fru, snr_num)) {
+    return 1;
+  }
+  return 0;
+}
+
 const char *
-numeric_state_to_name(unsigned int state, const char *name_str[], size_t n)
+numeric_state_to_name(unsigned int state, const char *name_str[], size_t n, const char* error_str)
 {
   if (state < 0 || state >= n  || name_str[state] == NULL) {
-      return "unknown_str_type";
+      return error_str;
   }
   return name_str[state];
 }
 
+static json_t *
+get_thresh_json_obj(thresh_sensor_t *thresh) {
+  json_t *thresh_obj = NULL;
+  char svalue[20];
+
+  if ((thresh->flag & 0x7E) && (thresh_obj = json_object())) {
+    if (thresh->flag & GETMASK(UCR_THRESH)) {
+      snprintf(svalue, sizeof(svalue), "%.2f", thresh->ucr_thresh);
+      json_object_set_new(thresh_obj, "UCR", json_string(svalue));
+    }
+
+    if (thresh->flag & GETMASK(UNC_THRESH)) {
+      snprintf(svalue, sizeof(svalue), "%.2f", thresh->unc_thresh);
+      json_object_set_new(thresh_obj, "UNC", json_string(svalue));
+    }
+
+    if (thresh->flag & GETMASK(UNR_THRESH)) {
+      snprintf(svalue, sizeof(svalue), "%.2f", thresh->unr_thresh);
+      json_object_set_new(thresh_obj, "UNR", json_string(svalue));
+    }
+
+    if (thresh->flag & GETMASK(LCR_THRESH)) {
+      snprintf(svalue, sizeof(svalue), "%.2f", thresh->lcr_thresh);
+      json_object_set_new(thresh_obj, "LCR", json_string(svalue));
+    }
+
+    if (thresh->flag & GETMASK(LNC_THRESH)) {
+      snprintf(svalue, sizeof(svalue), "%.2f", thresh->lnc_thresh);
+      json_object_set_new(thresh_obj, "LNC", json_string(svalue));
+    }
+
+    if (thresh->flag & GETMASK(LNR_THRESH)) {
+      snprintf(svalue, sizeof(svalue), "%.2f", thresh->lnr_thresh);
+      json_object_set_new(thresh_obj, "LNR", json_string(svalue));
+    }
+  }
+
+  return thresh_obj;
+}
+
 static void
 print_sensor_reading(float fvalue, uint16_t snr_num, thresh_sensor_t *thresh,
-       get_sensor_reading_struct *sensor_info, char *status, json_t *fru_sensor_obj) {
+       get_sensor_reading_struct *sensor_info, char *status, json_t *fru_sensor_obj, char * filter_sensor_name) {
 
   bool threshold = sensor_info->threshold;
   bool json = sensor_info->json;
+  bool filter = sensor_info->filter;
 
   if (json) {
     json_t *sensor_obj = json_object();
-    json_t *search = json_object();
+    json_t *search, *thresh_obj;
     char svalue[20];
-    snprintf(svalue, 20, "%.2f", fvalue);
 
     if (is_pldm_state_sensor(snr_num, sensor_info->fru)) {
-      json_object_set_new(sensor_obj, "value", 
+      json_object_set_new(sensor_obj, "value",
           json_string(numeric_state_to_name((int)fvalue, sensor_state_str,
-          sizeof(sensor_state_str)/sizeof(sensor_state_str[0]))));
+          sizeof(sensor_state_str)/sizeof(sensor_state_str[0]),UNKNOWN_STATE)));
       json_object_set_new(fru_sensor_obj, thresh->name, sensor_obj);
       return;
     }
 
+    if (threshold && (thresh_obj = get_thresh_json_obj(thresh))) {
+      json_object_set_new(sensor_obj, "thresholds", thresh_obj);
+    }
+    snprintf(svalue, sizeof(svalue), "%.2f", fvalue);
+    json_object_set_new(sensor_obj, "value", json_string(svalue));
+
     search = json_object_get(fru_sensor_obj, thresh->name);
     if (search != NULL) {
       /* in order to match the RESTAPI format */
-      json_t *value_array = json_array();
-      json_array_append(value_array, search);
-      json_object_set_new(sensor_obj, "value", json_string(svalue));
-      json_array_append(value_array, sensor_obj);
-      json_object_set(fru_sensor_obj, thresh->name, value_array);
+      if (json_is_object(search)) {
+        json_t *value_array = json_array();
+        json_array_append(value_array, search);
+        /*
+        Note : if we use append_new here,
+        the following "json_object_set_new(fru_sensor_obj, thresh->name, value_array)"
+        will free the json_object "search"
+        */
+        json_array_append_new(value_array, sensor_obj);
+        json_object_set_new(fru_sensor_obj, thresh->name, value_array);
+      } else if (json_is_array(search)) {
+        json_array_append_new(search, sensor_obj);
+      } else {
+        syslog(LOG_ERR, "[%s]get error type of the JSON obj", __func__);
+        json_decref(sensor_obj);
+      }
     } else {
-      json_object_set_new(sensor_obj, "value", json_string(svalue));
       json_object_set_new(fru_sensor_obj, thresh->name, sensor_obj);
     }
 
     return;
   }
 
-  if (is_pldm_state_sensor(snr_num, sensor_info->fru)) {
-    printf("%-28s (0x%X) : %10s    | (%s)",
-        thresh->name, snr_num,
-        numeric_state_to_name((int)fvalue, sensor_state_str,
-             sizeof(sensor_state_str)/sizeof(sensor_state_str[0])), status);
+  if (filter) {
+    printf("%-28s",filter_sensor_name);
   } else {
-    printf("%-28s (0x%X) : %7.2f %-5s | (%s)",
-        thresh->name, snr_num, fvalue, thresh->units, status);
+    printf("%-28s",thresh->name);
+  }
+
+  if (is_pldm_state_sensor(snr_num, sensor_info->fru)) {
+    printf(" (0x%X) : %10s    | (%s)",
+        snr_num,
+        numeric_state_to_name((int)fvalue, sensor_state_str,
+             sizeof(sensor_state_str)/sizeof(sensor_state_str[0]),UNKNOWN_STATE),
+             numeric_state_to_name((int)fvalue, sensor_status,
+             sizeof(sensor_status)/sizeof(sensor_status[0]),STATUS_NS));
+  } else {
+    printf(" (0x%X) : %7.2f %-5s | (%s)",
+        snr_num, fvalue, thresh->units, status);
   }
   if (threshold) {
     printf(" | UCR: ");
@@ -270,11 +374,21 @@ get_sensor_status(float fvalue, thresh_sensor_t *thresh, char *status) {
     sprintf(status, STATUS_LNR);
 }
 
+void
+alter_to_fsc_style_sensor_name (char * str) {
+  for(int i = 0; str[i]; i++){
+    if (str[i] == ' ')
+      str[i] = '_';
+    else
+      str[i] = tolower(str[i]);
+  }
+}
+
 static void*
 get_sensor_reading(void *sensor_data) {
 
   get_sensor_reading_struct *sensor_info = sensor_data;
-  int i;
+  int i = 0,j = 0;
   uint8_t snr_num;
   float fvalue;
   char status[8];
@@ -282,11 +396,17 @@ get_sensor_reading(void *sensor_data) {
   int ret = 0;
   char fruname[32] = {0};
   bool json = sensor_info->json;
+  bool filter = sensor_info->filter;
+  char filter_sensor_name[64] = {0};
   json_t *fru_sensor_obj = sensor_info->fru_sensor_obj;
 
   pthread_detach(pthread_self());
   //Allow this thread to be killed at any time
   pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+
+  for (i=0; i< sensor_info->filter_len; i++) {
+    alter_to_fsc_style_sensor_name(sensor_info->filter_list[i]);
+  }
 
   for (i = 0; i < sensor_info->sensor_cnt; i++) {
     snr_num = sensor_info->sensor_list[i];
@@ -321,28 +441,71 @@ get_sensor_reading(void *sensor_data) {
       }
     }
 
-    usleep(50);
-    if ((false == pal_sensor_is_cached(sensor_info->fru, snr_num)) || (true == sensor_info->force))
+    // for loop compare
+    if (filter) {
+      pal_get_fru_name(sensor_info->fru, fruname);
+      sprintf(filter_sensor_name,"%s_%s", fruname,thresh.name);
+      alter_to_fsc_style_sensor_name(filter_sensor_name);
+      for (j=0;j<sensor_info->filter_len;j++) {
+        if (strcmp(sensor_info->filter_list[j],filter_sensor_name) == 0) {
+          break;
+        }
+      }
+      if (j == sensor_info->filter_len) {
+        continue;
+      }
+      sprintf(filter_sensor_name,"%s %s", fruname,thresh.name);
+    }
+
+    if ((false == pal_sensor_is_cached(sensor_info->fru, snr_num)) || (true == sensor_info->force)) {
+      usleep(50);
       ret = sensor_raw_read(sensor_info->fru, snr_num, &fvalue);
-    else
+    } else {
       ret = sensor_cache_read(sensor_info->fru, snr_num, &fvalue);
+    }
 
     if (ret < 0) {
       // do not print unavaiable PLDM sensors
       if (!is_pldm_sensor(snr_num, sensor_info->fru)) {
         if (json) {
           json_t *sensor_obj = json_object();
+          json_t *search = json_object_get(fru_sensor_obj, thresh.name);
+
           json_object_set_new(sensor_obj, "value", json_string("NA"));
-          json_object_set_new(fru_sensor_obj, thresh.name, sensor_obj);
-          continue;
+          if (search != NULL) {
+            /* in order to match the RESTAPI format */
+            if (json_is_object(search)) {
+              json_t *value_array = json_array();
+              json_array_append(value_array, search);
+              /*
+              Note : if we use append_new here,
+              the following "json_object_set_new(fru_sensor_obj, thresh->name, value_array)"
+              will free the json_object "search"
+              */
+              json_array_append_new(value_array, sensor_obj);
+              json_object_set_new(fru_sensor_obj, thresh.name, value_array);
+            } else if (json_is_array(search)) {
+              json_array_append_new(search, sensor_obj);
+            } else {
+              syslog(LOG_ERR, "[%s]get error type of the JSON obj", __func__);
+              json_decref(sensor_obj);
+            }
+          } else {
+            json_object_set_new(fru_sensor_obj, thresh.name, sensor_obj);
+          }
+        } else if (filter) {
+          printf("%-28s (0x%X) : NA | (na)\n", filter_sensor_name, sensor_info->sensor_list[i]);
+        } else if (is_supported_sensor(snr_num, sensor_info->fru)) {
+          printf("%-28s (0x%X) : 0/NA | (na)\n", thresh.name, sensor_info->sensor_list[i]);
+        } else {
+          printf("%-28s (0x%X) : NA | (na)\n", thresh.name, sensor_info->sensor_list[i]);
         }
-        printf("%-28s (0x%X) : NA | (na)\n", thresh.name, sensor_info->sensor_list[i]);
       }
       continue;
     }
     else {
       get_sensor_status(fvalue, &thresh, status);
-      print_sensor_reading(fvalue, (uint16_t)snr_num, &thresh, sensor_info, status, fru_sensor_obj);
+      print_sensor_reading(fvalue, (uint16_t)snr_num, &thresh, sensor_info, status, fru_sensor_obj, filter_sensor_name);
     }
   }
 
@@ -399,7 +562,9 @@ get_sensor_history(uint8_t fru, uint8_t *sensor_list, int sensor_cnt, int num, i
     }
 
     if (sensor_read_history(fru, snr_num, &min, &average, &max, start_time) < 0) {
-      printf("%-18s (0x%X) min = NA, average = NA, max = NA\n", thresh.name, snr_num);
+      if (!is_pldm_sensor(snr_num, fru)) {
+        printf("%-18s (0x%X) min = NA, average = NA, max = NA\n", thresh.name, snr_num);
+      }
       continue;
     }
 
@@ -458,7 +623,7 @@ void get_sensor_reading_timer(struct timespec *timeout, get_sensor_reading_struc
   abs_time.tv_sec += timeout->tv_sec;
   abs_time.tv_nsec += timeout->tv_nsec;
 
-   pal_get_fru_name(sensor_data->fru, fruname);
+  pal_get_fru_name(sensor_data->fru, fruname);
 
   //Make get_sensor_reading a thread
   if (pthread_create(&tid_get_sensor_reading, NULL, get_sensor_reading, (void *) sensor_data) < 0) {
@@ -502,7 +667,7 @@ void get_sensor_reading_timer(struct timespec *timeout, get_sensor_reading_struc
 }
 
 static int
-print_sensor(uint8_t fru, int sensor_num, bool history, bool threshold, bool force, bool json, bool history_clear, long period, json_t *fru_sensor_obj) {
+print_sensor(uint8_t fru, int sensor_num, bool history, bool threshold, bool force, bool json, bool history_clear, bool filter, char** filter_list, int filter_len,long period, json_t *fru_sensor_obj) {
   int ret;
   uint8_t status;
   int sensor_cnt;
@@ -538,23 +703,27 @@ print_sensor(uint8_t fru, int sensor_num, bool history, bool threshold, bool for
     }
     ret = pal_is_fru_prsnt(fru, &status);
     if (ret < 0) {
-      printf("pal_is_fru_prsnt failed for fru: %s\n", fruname);
+      if (json == 0)
+        printf("pal_is_fru_prsnt failed for fru: %s\n", fruname);
       return ret;
     }
     if (status == 0) {
-      printf("%s is not present!\n\n", fruname);
+      if (json == 0)
+        printf("%s is not present!\n\n", fruname);
       return -1;
     }
 
     ret = pal_is_fru_ready(fru, &status);
     if ((ret < 0) || (status == 0)) {
-      printf("%s is unavailable!\n\n", fruname);
+      if (json == 0)
+        printf("%s is unavailable!\n\n", fruname);
       return ret;
     }
 
     ret = pal_get_fru_sensor_list(fru, &sensor_list, &sensor_cnt);
     if (ret < 0) {
-      printf("%s get sensor list failed!\n", fruname);
+      if (json == 0)
+        printf("%s get sensor list failed!\n", fruname);
       return ret;
     }
   }
@@ -574,6 +743,9 @@ print_sensor(uint8_t fru, int sensor_num, bool history, bool threshold, bool for
     data.threshold = threshold;
     data.force = force;
     data.json = json;
+    data.filter = filter;
+    data.filter_list = filter_list;
+    data.filter_len = filter_len;
     data.fru_sensor_obj = fru_sensor_obj;
     data.sensor_list = sensor_list;
     // memcpy(data.sensor_list, sensor_list, sizeof(uint8_t)*sensor_cnt);
@@ -591,10 +763,10 @@ print_sensor(uint8_t fru, int sensor_num, bool history, bool threshold, bool for
 }
 
 int parse_args(int argc, char *argv[], char *fruname,
-    bool *history_clear, bool *history, bool *threshold, bool *force, bool *json, long *period, int *snr)
+    bool *history_clear, bool *history, bool *threshold, bool *force, bool *json, bool *filter, long *period, int *snr)
 {
   int ret;
-  int num;
+  int num, options = 0;
   char *end;
   int index;
   static struct option long_opts[] = {
@@ -603,6 +775,7 @@ int parse_args(int argc, char *argv[], char *fruname,
     {"threshold", no_argument,     0, 't'},
     {"force", no_argument, 0, 'f'},
     {"json", no_argument, 0, 'j'},
+    {"filter", no_argument, 0, 'i'},
     {0,0,0,0},
   };
 
@@ -612,6 +785,7 @@ int parse_args(int argc, char *argv[], char *fruname,
   *threshold = false;
   *force = false;
   *json = false;
+  *filter = false;
   *period = 60;
   *snr = -1;
 
@@ -620,17 +794,25 @@ int parse_args(int argc, char *argv[], char *fruname,
       case 'f':
         *force = true;
         break;
+      case 'i':
+        *filter = true;
+        options |= (1 << 4);
+        break;
       case 'j':
         *json = true;
+        options |= (1 << 3);
         break;
       case 'c':
         *history_clear = true;
+        options |= (1 << 2);
         break;
       case 't':
         *threshold = true;
+        options |= (1 << 1);
         break;
       case 'h':
         *history = true;
+        options |= (1 << 0);
         if (convert_period(optarg, period)) {
           return -1;
         }
@@ -653,17 +835,23 @@ int parse_args(int argc, char *argv[], char *fruname,
   }
   strcpy(fruname, argv[optind]);
 
-  if (argc > optind + 1) {
-    *snr = strtol(argv[optind + 1], &end, 0);
-    if (!end || *end != '\0') {
-      printf("Invalid sensor: %s\n", argv[optind + 1]);
+  if (*filter) {
+    if (argc <= optind + 1) {
+      printf("No sensor name\n");
       return -1;
     }
+  } else {
+    if (argc > optind + 1) {
+      *snr = strtol(argv[optind + 1], &end, 0);
+      if (!end || *end != '\0') {
+        printf("Invalid sensor: %s\n", argv[optind + 1]);
+        return -1;
+      }
+    }
   }
-  /* Only one of these flags should be on at
-   * any time */
-  num = (int)*threshold + (int)*history_clear + (int)*history + (int)*json;
-  if (num > 1) {
+
+  num = (int)*threshold + (int)*history_clear + (int)*history + (int)*json + (int)*filter;
+  if ((num > 1) && (options != 0x0A)) {  // threshold + json
     return -1;
   }
 
@@ -681,13 +869,16 @@ main(int argc, char **argv) {
   bool history_clear;
   bool force;
   bool json;
+  bool filter;
   long period;
   char fruname[32];
+  int filter_len = argc - 3;
+  char ** filter_list = argv + 3;
   json_t *fru_sensor_obj = json_object();
 
   if (parse_args(argc, argv, fruname,
         &history_clear, &history,
-        &threshold, &force, &json, &period, &num)) {
+        &threshold, &force, &json, &filter, &period, &num)) {
     print_usage();
     exit(-1);
   }
@@ -711,14 +902,14 @@ main(int argc, char **argv) {
 
   if (fru == 0) {
     for (fru = 1; fru <= MAX_NUM_FRUS; fru++) {
-      ret |= print_sensor(fru, num, history, threshold, force, json, history_clear, period, fru_sensor_obj);
+      ret |= print_sensor(fru, num, history, threshold, force, json, history_clear, filter, filter_list, filter_len, period, fru_sensor_obj);
     }
-    ret |= print_sensor(AGGREGATE_SENSOR_FRU_ID, num, history, threshold, false, json, history_clear, period, fru_sensor_obj);
+    ret |= print_sensor(AGGREGATE_SENSOR_FRU_ID, num, history, threshold, false, json, history_clear, filter, filter_list, filter_len, period, fru_sensor_obj);
   } else if (pal_get_pair_fru(fru, &pair_fru)) {
-    ret = print_sensor(fru, num, history, threshold, fru == AGGREGATE_SENSOR_FRU_ID ? false : force, json, history_clear, period, fru_sensor_obj);
-    ret = print_sensor(pair_fru, num, history, threshold, pair_fru == AGGREGATE_SENSOR_FRU_ID ? false : force, json, history_clear, period, fru_sensor_obj);
+    ret = print_sensor(fru, num, history, threshold, fru == AGGREGATE_SENSOR_FRU_ID ? false : force, json, history_clear, filter, filter_list, filter_len, period, fru_sensor_obj);
+    ret = print_sensor(pair_fru, num, history, threshold, pair_fru == AGGREGATE_SENSOR_FRU_ID ? false : force, json, history_clear, filter, filter_list, filter_len ,period, fru_sensor_obj);
   } else {
-    ret = print_sensor(fru, num, history, threshold, fru == AGGREGATE_SENSOR_FRU_ID ? false : force, json, history_clear, period, fru_sensor_obj);
+    ret = print_sensor(fru, num, history, threshold, fru == AGGREGATE_SENSOR_FRU_ID ? false : force, json, history_clear, filter, filter_list, filter_len, period, fru_sensor_obj);
   }
 
   if (json) {

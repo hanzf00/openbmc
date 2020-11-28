@@ -30,10 +30,10 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <pthread.h>
-#include <openbmc/obmc-sensor.h>
 #include <openbmc/kv.h>
 #include <facebook/bic.h>
 #include "pal.h"
+#include "pal_sensors.h"
 
 #define BIT(value, index) ((value >> index) & 1)
 
@@ -139,10 +139,7 @@
 #define DELAY_POWER_CYCLE 10
 #define DELAY_12V_CYCLE 5
 
-#ifdef CONFIG_FBTTN
-#define DELAY_FULL_POWER_DOWN 3
 #define RETRY_COUNT 5
-#endif
 
 #define CRASHDUMP_BIN       "/usr/local/bin/dump.sh"
 #define CRASHDUMP_FILE      "/mnt/data/crashdump_"
@@ -166,6 +163,11 @@
 #define AST_POR_FLAG "/tmp/ast_por"
 // SHIFT to 16
 #define UART1_TXD 0
+
+#define NUM_SERVER_FRU  1
+#define NUM_NIC_FRU     1
+#define NUM_BMC_FRU     1
+
 
 unsigned char g_err_code[ERROR_CODE_NUM];
 
@@ -193,6 +195,15 @@ const char pal_fru_list_print[] = "all, server, iom, dpb, scc"; // Cannot read f
 const char pal_fru_list_rw[] = "server, iom"; // Cannot write fruid to "scc" and "dpb"
 const char pal_server_list[] = "server";
 const char pal_fru_list_sensor_history[] = "all, server, iom, nic"; // Cannot show sensor history to "scc" and "dpb"
+
+const char *pal_server_fru_list[NUM_SERVER_FRU] = {"server"};
+const char *pal_nic_fru_list[NUM_NIC_FRU] = {"nic"};
+const char *pal_bmc_fru_list[NUM_BMC_FRU] = {"bmc"};
+
+size_t server_fru_cnt = NUM_SERVER_FRU;
+size_t nic_fru_cnt  = NUM_NIC_FRU;
+size_t bmc_fru_cnt  = NUM_BMC_FRU;
+
 
 size_t pal_pwm_cnt = 2;
 size_t pal_tach_cnt = 8;
@@ -570,9 +581,6 @@ server_power_on(uint8_t slot_id) {
 static int
 server_power_off(uint8_t slot_id, bool gs_flag, bool cycle_flag) {
   char vpath[64] = {0};
-  uint8_t status;
-  int retry = 0;
-  int iom_board_id = BOARD_MP;
 
   if (slot_id != FRU_SLOT1) {
     return -1;
@@ -599,38 +607,6 @@ server_power_off(uint8_t slot_id, bool gs_flag, bool cycle_flag) {
   if (write_device(vpath, "1")) {
     return -1;
   }
-
-// TODO: Workaround for EVT only. Remove after PVT.
-#ifdef CONFIG_FBTTN
-  iom_board_id = pal_get_iom_board_id();
-  if(iom_board_id == BOARD_EVT) { // EVT only
-  // When ML-CPU is made sure shutdown that is not power-cycle, we should power-off M.2/IOC by BMC.
-  //if (cycle_flag == false) {
-    do {
-      if (pal_get_server_power(slot_id, &status) < 0) {
-        #ifdef DEBUG
-        syslog(LOG_WARNING, "server_power_off: pal_get_server_power status is %d\n", status);
-        #endif
-      }
-      sleep(DELAY_FULL_POWER_DOWN);
-      if (retry > RETRY_COUNT) {
-        #ifdef DEBUG
-        syslog(LOG_WARNING, "server_power_off: retry fail\n");
-        #endif
-        break;
-      }
-      else {
-        retry++;
-      }
-    } while (status != SERVER_POWER_OFF);
-    // M.2/IOC power-off
-    sprintf(vpath, GPIO_VAL, GPIO_IOM_FULL_PWR_EN);
-    if (write_device(vpath, "0")) {
-      return -1;
-    }
-  //}
-  }
-#endif
 
   return 0;
 }
@@ -1676,7 +1652,10 @@ pal_sensor_threshold_flag(uint8_t fru, uint8_t snr_num, uint16_t *flag) {
 
 int
 pal_get_sensor_threshold(uint8_t fru, uint8_t sensor_num, uint8_t thresh, void *value) {
-  return fbttn_sensor_threshold(fru, sensor_num, thresh, value);
+  int iom_type = IOM_M2;
+
+  iom_type = pal_get_iom_type();
+  return fbttn_sensor_threshold(fru, sensor_num, thresh, value, iom_type);
 }
 
 int
@@ -2181,6 +2160,31 @@ pal_get_event_sensor_name(uint8_t fru, uint8_t *sel, char *name) {
 }
 
 int
+pal_parse_mem_mapping_str(uint8_t map_of_dimm_num, char *mem_mapping_string) {
+
+  mem_mapping_string[0] = '\0';
+  switch (map_of_dimm_num) {
+    case 0x00:
+      strcpy(mem_mapping_string, "A0");
+      break;
+    case 0x01:
+      strcpy(mem_mapping_string, "A1");
+      break;
+    case 0x08:
+      strcpy(mem_mapping_string, "B0");
+      break;
+    case 0x09:
+      strcpy(mem_mapping_string, "B1");
+      break;
+    default:
+      strcpy(mem_mapping_string, "Unknown");
+      break;
+  }
+
+  return 0;
+}
+
+int
 pal_parse_sel(uint8_t fru, uint8_t *sel, char *error_log) {
   bool parsed;
   uint8_t snr_type = sel[10];
@@ -2189,6 +2193,7 @@ pal_parse_sel(uint8_t fru, uint8_t *sel, char *error_log) {
   uint8_t *ed = &event_data[3];
   char temp_log[512] = {0};
   char err_str[512] = {0};
+  char mem_mapping_string[512] = {0};
   uint8_t sen_type = event_data[0];
   uint8_t event_type = sel[12] & 0x7F;
   uint8_t event_dir = sel[12] & 0x80;
@@ -2257,16 +2262,18 @@ pal_parse_sel(uint8_t fru, uint8_t *sel, char *error_log) {
           break;
         case MEMORY_ECC_ERR:
           parsed = true;
+          map_of_dimm_num = ed[2];
+          memset(mem_mapping_string, '\0', sizeof(mem_mapping_string));
+          pal_parse_mem_mapping_str(map_of_dimm_num, mem_mapping_string);
+
           if (sen_type == 0x0C) {
             // SEL from MEMORY_ECC_ERR
             if ((ed[0] & 0x0F) == 0x0) {
               strcat(error_log, "Correctable");
-              sprintf(temp_log, "DIMM%02X ECC err", ed[2]);
-              pal_add_cri_sel(temp_log);
+              snprintf(temp_log, sizeof(temp_log), "DIMM %s(%02X) ECC err", mem_mapping_string, map_of_dimm_num);
             } else if ((ed[0] & 0x0F) == 0x1) {
               strcat(error_log, "Uncorrectable");
-              sprintf(temp_log, "DIMM%02X UECC err", ed[2]);
-              pal_add_cri_sel(temp_log);
+              snprintf(temp_log, sizeof(temp_log), "DIMM %s(%02X) UECC err", mem_mapping_string, map_of_dimm_num);
             } else if ((ed[0] & 0x0F) == 0x5) {
               strcat(error_log, "Correctable ECC error Logging Limit Reached");
             } else {
@@ -2282,10 +2289,10 @@ pal_parse_sel(uint8_t fru, uint8_t *sel, char *error_log) {
           }
 
           // Common routine for both MEM_ECC_ERR and MEMORY_ERR_LOG_DIS
-          sprintf(temp_log, " (DIMM %02X)", ed[2]);
+          snprintf(temp_log, sizeof(temp_log), " (DIMM %s)", mem_mapping_string);
           strcat(error_log, temp_log);
 
-          sprintf(temp_log, " Logical Rank %d", ed[1] & 0x03);
+          snprintf(temp_log, sizeof(temp_log), " Logical Rank %d", ed[1] & 0x03);
           strcat(error_log, temp_log);
 
           // Bit[7:5]: CPU number     (Range: 0-7)
@@ -2295,47 +2302,38 @@ pal_parse_sel(uint8_t fru, uint8_t *sel, char *error_log) {
             /* All Info Valid */
             // uint8_t chn_num = (ed[2] & 0x18) >> 3;
             // uint8_t dimm_num = ed[2] & 0x7;
-            map_of_dimm_num = ed[2];
 
             /* If critical SEL logging is available, do it */
             if (sen_type == 0x0C) {
               if ((ed[0] & 0x0F) == 0x0) {
-                sprintf(err_str, "ECC err");
+                snprintf(err_str, sizeof(err_str), "ECC err");
               } else if ((ed[0] & 0x0F) == 0x1) {
-                sprintf(err_str, "UECC err");
+                snprintf(err_str, sizeof(err_str), "UECC err");
+              } else if ((ed[0] & 0x0F) == 0x5) {
+                snprintf(err_str, sizeof(err_str), "ECC err logging limit reached");
+              } else {
+                snprintf(err_str, sizeof(err_str), "Unknown err");
               }
-              switch (map_of_dimm_num) {
-                case 0x00:
-                  sprintf(temp_log, "DIMMA0(%02X) %s, FRU: %u", map_of_dimm_num, err_str, fru);
-                  break;
-                case 0x01:
-                  sprintf(temp_log, "DIMMA1(%02X) %s, FRU: %u", map_of_dimm_num, err_str, fru);
-                  break;
-                case 0x08:
-                  sprintf(temp_log, "DIMMB0(%02X) %s, FRU: %u", map_of_dimm_num, err_str, fru);
-                  break;
-                case 0x09:
-                  sprintf(temp_log, "DIMMB1(%02X) %s, FRU: %u", map_of_dimm_num, err_str, fru);
-                  break;
-              }
+
+              snprintf(temp_log, sizeof(temp_log), "DIMM %s(%02X) %s, FRU %u", mem_mapping_string, map_of_dimm_num, err_str, fru);
               pal_add_cri_sel(temp_log);
             }
             /* Then continue parse the error into a string. */
             /* All Info Valid                               */
             strcpy(temp_log, "");
-            sprintf(temp_log, " (CPU# %d, CHN# %d, DIMM# %d)",
+            snprintf(temp_log, sizeof(temp_log)," (CPU# %d, CHN# %d, DIMM# %d)",
                 (ed[2] & 0xE0) >> 5, (ed[2] & 0x18) >> 3, ed[2] & 0x7);
           } else if (((ed[1] & 0xC) >> 2) == 0x1) {
             /* DIMM info not valid */
-            sprintf(temp_log, " (CPU# %d, CHN# %d)",
+            snprintf(temp_log, sizeof(temp_log), " (CPU# %d, CHN# %d)",
                 (ed[2] & 0xE0) >> 5, (ed[2] & 0x18) >> 3);
           } else if (((ed[1] & 0xC) >> 2) == 0x2) {
             /* CHN info not valid */
-            sprintf(temp_log, " (CPU# %d, DIMM# %d)",
+            snprintf(temp_log, sizeof(temp_log), " (CPU# %d, DIMM# %d)",
                 (ed[2] & 0xE0) >> 5, ed[2] & 0x7);
           } else if (((ed[1] & 0xC) >> 2) == 0x3) {
             /* CPU info not valid */
-            sprintf(temp_log, " (CHN# %d, DIMM# %d)",
+            snprintf(temp_log, sizeof(temp_log), " (CHN# %d, DIMM# %d)",
                 (ed[2] & 0x18) >> 3, ed[2] & 0x7);
           }
           strcat(error_log, temp_log);
@@ -4456,7 +4454,7 @@ int pal_bypass_cmd(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *re
       return completion_code;
     }
 
-    if (0 == select) { //BIC
+    if (BYPASS_BIC == select) { //BIC
       // Bypass command to Bridge IC
       if (tlen != 0) {
         ret = bic_ipmb_wrapper(slot, netfn, cmd, &req_data[3], tlen, res_data, res_len);
@@ -4468,7 +4466,7 @@ int pal_bypass_cmd(uint8_t slot, uint8_t *req_data, uint8_t req_len, uint8_t *re
         completion_code = CC_SUCCESS;
       }
 
-    } else if (1 == select) { //ME
+    } else if (BYPASS_ME == select) { //ME
       tlen += 2;
       memcpy(tbuf, &req_data[1], tlen);
       tbuf[0] = tbuf[0] << 2;

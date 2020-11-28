@@ -31,16 +31,25 @@ class FscSensorBase(object):
     def __init__(self, **kwargs):
         if "name" in kwargs:
             self.name = kwargs["name"]
+        if "inf" in kwargs:
+            self.inf = kwargs["inf"]
         if "read_source" in kwargs:
             self.read_source = kwargs["read_source"]
         if "write_source" in kwargs:
             self.write_source = kwargs["write_source"]
+            if "max_duty_register" in kwargs:
+                self.max_duty_register = kwargs["max_duty_register"]
+            else:
+                self.max_duty_register = 100
         else:
             self.write_source = None
+
         self.read_source_fail_counter = 0
         self.write_source_fail_counter = 0
         self.read_source_wrong_counter = 0
         self.hwmon_source = None
+        self.last_error_time = 0
+        self.last_error_level = None
 
     @abc.abstractmethod
     def read(self, **kwargs):
@@ -133,7 +142,12 @@ class FscSensorSourceSysfs(FscSensorBase):
         """
         if self.write_source is None:
             return
-        cmd = "echo " + str(value) + " > " + self.write_source
+        cmd = (
+            "echo "
+            + str(value * self.max_duty_register / 100)
+            + " > "
+            + self.write_source
+        )
         Logger.debug("Setting value using cmd=%s" % cmd)
         response = ""
         try:
@@ -167,7 +181,17 @@ class FscSensorSourceUtil(FscSensorBase):
         """
         cmd = self.read_source
         if "fru" in kwargs:
-            if "num" in kwargs and len(kwargs["num"]):
+            if "inf" in kwargs and kwargs["inf"] is not None:
+                cmd += " " + kwargs["fru"] +" --filter"
+                inf =  kwargs["inf"]
+                for name in inf["ext_vars"]:
+                    sdata = name.split(":")
+                    board = sdata[0]
+                    if board != kwargs["fru"]:
+                        continue
+                    #sname = sdata[1]
+                    cmd += " " + sdata[1]
+            elif "num" in kwargs and len(kwargs["num"]):
                 cmd = ""
                 for num in kwargs["num"]:
                     cmd += self.read_source + " " + kwargs["fru"] + " " + num + ";"
@@ -196,7 +220,7 @@ class FscSensorSourceUtil(FscSensorBase):
         """
         if self.write_source is None:
             return
-        cmd = self.write_source % (int(value))
+        cmd = self.write_source % (int(value * self.max_duty_register / 100))
         Logger.debug("Setting value using cmd=%s" % cmd)
         response = ""
         try:

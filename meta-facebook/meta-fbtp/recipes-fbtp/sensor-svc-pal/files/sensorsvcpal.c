@@ -69,13 +69,11 @@
 #define RISER_BUS_ID 0x1
 
 #define GUID_SIZE 16
-#define FRU_EEPROM "/sys/devices/platform/ast-i2c.6/i2c-6/6-0054/eeprom"
 
 #define READING_NA -2
 #define READING_SKIP 1
 
 #define NIC_MAX_TEMP 125
-#define PLAT_ID_SKU_MASK 0x10 // BIT4: 0- Single Side, 1- Double Side
 
 #define MAX_READ_RETRY 10
 #define POST_CODE_FILE       "/sys/devices/platform/ast-snoop-dma.0/data_history"
@@ -87,7 +85,6 @@ static size_t pal_pwm_cnt = 2;
 
 static int key_func_por_policy (int event, void *arg);
 static int key_func_lps (int event, void *arg);
-static int key_func_ntp (int event, void *arg);
 static int key_func_tz (int event, void *arg);
 
 static uint8_t power_fail_log = 0;
@@ -112,7 +109,7 @@ struct pal_key_cfg {
   {"nic_sensor_health", "1", NULL},
   {"server_sel_error", "1", NULL},
   {"server_boot_order", "0000000", NULL},
-  {"ntp_server", "", key_func_ntp},
+  {"ntp_server", "", NULL},
   {"time_zone", "UTC", key_func_tz},
   /* Add more Keys here */
   {LAST_KEY, LAST_KEY, NULL} /* This is the last key of the list */
@@ -1576,38 +1573,6 @@ key_func_lps (int event, void *arg)
 }
 
 static int
-key_func_ntp (int event, void *arg)
-{
-  char cmd[MAX_VALUE_LEN];
-  char ntp_server_new[MAX_VALUE_LEN];
-  char ntp_server_old[MAX_VALUE_LEN];
-
-  switch (event) {
-    case KEY_BEFORE_SET:
-      // Remove old NTP server
-      kv_get("ntp_server", ntp_server_old, NULL, KV_FPERSIST);
-      if (strlen(ntp_server_old) > 2) {
-        snprintf(cmd, MAX_VALUE_LEN, "sed -i '/^server %s$/d' /etc/ntp.conf", ntp_server_old);
-        system(cmd);
-      }
-      // Add new NTP server
-      snprintf(ntp_server_new, MAX_VALUE_LEN, "%s", (char *)arg);
-      if (strlen(ntp_server_new) > 2) {
-        snprintf(cmd, MAX_VALUE_LEN, "echo \"server %s\" >> /etc/ntp.conf", ntp_server_new);
-        system(cmd);
-      }
-      // Restart NTP server
-      snprintf(cmd, MAX_VALUE_LEN, "/etc/init.d/ntpd restart > /dev/null &");
-      system(cmd);
-      break;
-    case KEY_AFTER_INI:
-      break;
-  }
-
-  return 0;
-}
-
-static int
 key_func_tz (int event, void *arg)
 {
   char cmd[MAX_VALUE_LEN];
@@ -1675,7 +1640,8 @@ pal_check_postcodes(uint8_t fru_id, uint8_t sensor_num, float *value) {
   static int log_asserted = 0;
   const int loop_threshold = 3;
   const int longest_loop_code = 4;
-  int i, nearest_00, len, loop_count, check_until;
+  int i, nearest_00, loop_count, check_until;
+  size_t len;
   uint8_t buff[256];
   uint8_t location, maj_err, min_err, mem_train_fail;
   int ret = READING_NA, rc;
@@ -1694,7 +1660,7 @@ pal_check_postcodes(uint8_t fru_id, uint8_t sensor_num, float *value) {
   }
 
   len = 0; // clear higher bits
-  rc = pal_get_80port_record(FRU_MB, NULL, 0, buff, (uint8_t *)&len);
+  rc = pal_get_80port_record(FRU_MB, buff, sizeof(buff), &len);
   if (rc != PAL_EOK)
     goto error_exit;
 
@@ -1795,7 +1761,7 @@ pal_check_frb3(uint8_t fru_id, uint8_t sensor_num, float *value) {
     retry = 0;
     // cache current postcode buffer
     memset(postcodes_last, 0, sizeof(postcodes_last));
-    pal_get_80port_record(FRU_MB, NULL, 0, postcodes_last, (uint8_t *)&len);
+    pal_get_80port_record(FRU_MB, postcodes_last, sizeof(postcodes_last), &len);
   }
 
   if (frb3_fail) {
@@ -1805,7 +1771,7 @@ pal_check_frb3(uint8_t fru_id, uint8_t sensor_num, float *value) {
 
     // Port 80 updated
     memset(postcodes, 0, sizeof(postcodes_last));
-    rc = pal_get_80port_record(FRU_MB, NULL, 0, postcodes, (uint8_t *)&len);
+    rc = pal_get_80port_record(FRU_MB, postcodes, sizeof(postcodes), &len);
     if (rc == PAL_EOK && memcmp(postcodes_last, postcodes, 256) != 0) {
       frb3_fail = 0;
     }
